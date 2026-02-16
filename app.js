@@ -59,12 +59,20 @@ function slugName(name) {
   return safeText(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
 
+function wordsName(name) {
+  return safeText(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+}
+
 function portraitBases(actorName) {
   const raw = safeText(actorName).trim();
-  const slug = slugName(raw);
+  const rawLower = raw.toLowerCase();
+  const words = wordsName(raw);
+  const slug = words.replace(/\s+/g, "-");
   const bases = [];
   if (raw) bases.push(`${raw}${LOCAL_PORTRAIT_SUFFIX}`);
-  if (slug && slug !== raw) bases.push(`${slug}${LOCAL_PORTRAIT_SUFFIX}`);
+  if (rawLower && rawLower !== raw) bases.push(`${rawLower}${LOCAL_PORTRAIT_SUFFIX}`);
+  if (words && words !== rawLower) bases.push(`${words}${LOCAL_PORTRAIT_SUFFIX}`);
+  if (slug) bases.push(`${slug}${LOCAL_PORTRAIT_SUFFIX}`);
   return [...new Set(bases)];
 }
 
@@ -867,6 +875,7 @@ function applyGlobalSearch() {
 
 async function initialise() {
   setStatus("Loading…");
+  portraitUrlCache.clear();
   let payloads = [];
   try {
     payloads = await loadManifestPayloads();
