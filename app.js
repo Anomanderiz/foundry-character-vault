@@ -204,7 +204,7 @@ function quickAccessNav(items) {
 
   const title = document.createElement("div");
   title.className = "px-1 text-[11px] uppercase tracking-wide text-slate-300";
-  title.textContent = "Quick Access";
+  title.textContent = "Quick Access Bar";
   top.appendChild(title);
 
   const toggle = document.createElement("button");
@@ -236,7 +236,6 @@ function quickAccessNav(items) {
     nav.dataset.expanded = expanded ? "1" : "0";
     toggle.textContent = expanded ? "Close" : "Open";
     toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
-    title.style.display = expanded ? "block" : "none";
     list.style.display = expanded ? "flex" : "none";
   };
 
