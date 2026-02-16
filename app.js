@@ -55,6 +55,47 @@ function actorFromPayload(payload) {
   return payload?.actor || payload?.data?.actor || payload?.document || payload;
 }
 
+function resolveItemNameById(actor, id, preferredTypes = []) {
+  const wantedId = safeText(id).trim();
+  if (!wantedId) return "";
+  const items = actor?.items || [];
+
+  const typeMatch = items.find((it) =>
+    safeText(it?._id).trim() === wantedId &&
+    (!preferredTypes.length || preferredTypes.includes(it?.type))
+  );
+  if (typeMatch?.name) return safeText(typeMatch.name).trim();
+
+  const anyMatch = items.find((it) => safeText(it?._id).trim() === wantedId);
+  if (anyMatch?.name) return safeText(anyMatch.name).trim();
+
+  return "";
+}
+
+function detailLabel(actor, value, preferredTypes = []) {
+  if (value === null || value === undefined) return "";
+
+  if (typeof value === "string") {
+    const raw = value.trim();
+    if (!raw) return "";
+    const fromItem = resolveItemNameById(actor, raw, preferredTypes);
+    return fromItem || raw;
+  }
+
+  if (typeof value === "object") {
+    const explicit = safeText(value?.name || value?.label).trim();
+    if (explicit) return explicit;
+    const refId = safeText(value?._id || value?.id || value?.uuid).trim();
+    if (refId) {
+      const fromItem = resolveItemNameById(actor, refId, preferredTypes);
+      return fromItem || refId;
+    }
+    return "";
+  }
+
+  return safeText(value).trim();
+}
+
 function slugName(name) {
   return safeText(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
@@ -557,8 +598,8 @@ function extractSearchCorpus(payload) {
   const bits = [];
   bits.push(actor?.name);
   bits.push(sys?.details?.class);
-  bits.push(sys?.details?.race);
-  bits.push(sys?.details?.background);
+  bits.push(detailLabel(actor, sys?.details?.race, ["race"]));
+  bits.push(detailLabel(actor, sys?.details?.background, ["background"]));
 
   for (const it of items) bits.push(it?.name);
 
@@ -712,8 +753,8 @@ function renderDnd5e(payload) {
   `;
   const pills = hero.querySelector("#pills");
   pills.appendChild(pill(meta.line2));
-  const race = sys?.details?.race;
-  const bg = sys?.details?.background;
+  const race = detailLabel(actor, sys?.details?.race, ["race"]);
+  const bg = detailLabel(actor, sys?.details?.background, ["background"]);
   const align = sys?.details?.alignment;
   [race, bg, align].filter(Boolean).forEach(x => pills.appendChild(pill(x)));
 
