@@ -2,19 +2,19 @@
   {
     "name": "Goody",
     "file": "./data/actors/goody.json"
-  }
+  },
   {
     "name": "Kira-Kira Eventide",
     "file": "./data/actors/kira-kira-eventide.json"
-  }
+  },
   {
     "name": "Meredith Vixeni",
     "file": "./data/actors/meredith-vixeni.json"
-  }
+  },
   {
     "name": "Thrum",
     "file": "./data/actors/Thrum-istra.json"
-  }
+  },
   {
     "name": "Lancer",
     "file": "./data/actors/lancer-karl.json"
