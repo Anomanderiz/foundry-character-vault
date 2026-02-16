@@ -377,8 +377,122 @@ function renderActiveEffects(actor) {
   return listCards(effects, (e) => e.meta);
 }
 
+const MODE_CUSTOM = 0;
+const MODE_MULTIPLY = 1;
 const MODE_ADD = 2;
+const MODE_DOWNGRADE = 3;
+const MODE_UPGRADE = 4;
 const MODE_OVERRIDE = 5;
+
+function isTruthyEffectValue(raw) {
+  const n = tryNum(raw);
+  if (Number.isFinite(n)) return n !== 0;
+  const s = norm(raw);
+  return s === "true" || s === "yes" || s === "on";
+}
+
+function applyNumericEffectMode(current, value, mode) {
+  const curr = Number.isFinite(current) ? Number(current) : 0;
+  const val = Number(value);
+  if (!Number.isFinite(val)) return curr;
+
+  if (mode === MODE_ADD) return curr + val;
+  if (mode === MODE_MULTIPLY) return curr * val;
+  if (mode === MODE_DOWNGRADE) return Math.min(curr, val);
+  if (mode === MODE_UPGRADE) return Math.max(curr, val);
+  // Foundry "CUSTOM" (0) commonly acts as set for simple numeric exports.
+  if (mode === MODE_CUSTOM || mode === MODE_OVERRIDE) return val;
+  return curr;
+}
+
+function computeMovement(actor) {
+  const out = {};
+  const keys = ["walk", "burrow", "climb", "fly", "swim"];
+  const movement = actor?.system?.attributes?.movement || {};
+  for (const k of keys) out[k] = tryNum(movement?.[k]) ?? 0;
+
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      if (!key.startsWith("system.attributes.movement.")) continue;
+      const val = tryNum(ch?.value);
+      if (!Number.isFinite(val)) continue;
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+
+      if (key === "system.attributes.movement.all") {
+        for (const k of keys) out[k] = applyNumericEffectMode(out[k], val, mode);
+        continue;
+      }
+
+      const m = key.match(/^system\.attributes\.movement\.(walk|burrow|climb|fly|swim)$/);
+      if (!m) continue;
+      out[m[1]] = applyNumericEffectMode(out[m[1]], val, mode);
+    }
+  }
+
+  for (const k of keys) out[k] = Math.max(0, Number(out[k]) || 0);
+  return out;
+}
+
+function formatMovement(movement) {
+  const order = ["walk", "burrow", "climb", "fly", "swim"];
+  const bits = [];
+  for (const k of order) {
+    const v = tryNum(movement?.[k]);
+    if (!Number.isFinite(v)) continue;
+    if (v <= 0 && k !== "walk") continue;
+    bits.push(`${k} ${v}`);
+  }
+  return bits.join(", ") || "–";
+}
+
+function computeSenses(actor) {
+  const keys = ["darkvision", "blindsight", "tremorsense", "truesight"];
+  const senses = actor?.system?.attributes?.senses || {};
+  const out = {};
+  for (const k of keys) out[k] = tryNum(senses?.[k]) ?? 0;
+
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      const m = key.match(/^system\.attributes\.senses\.(darkvision|blindsight|tremorsense|truesight)$/);
+      if (!m) continue;
+
+      const val = tryNum(ch?.value);
+      if (!Number.isFinite(val)) continue;
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+      const senseKey = m[1];
+      out[senseKey] = applyNumericEffectMode(out[senseKey], val, mode);
+    }
+  }
+
+  for (const k of keys) out[k] = Math.max(0, Number(out[k]) || 0);
+  return out;
+}
+
+function formatSenses(senses, special) {
+  const labels = {
+    darkvision: "Darkvision",
+    blindsight: "Blindsight",
+    tremorsense: "Tremorsense",
+    truesight: "Truesight"
+  };
+
+  const bits = [];
+  for (const k of Object.keys(labels)) {
+    const v = tryNum(senses?.[k]);
+    if (Number.isFinite(v) && v > 0) bits.push(`${labels[k]} ${v}`);
+  }
+
+  const specialText = safeText(special).trim();
+  if (specialText) bits.push(specialText);
+
+  return bits.join(", ") || "–";
+}
 
 // Pull only numeric changes that we can safely apply offline.
 function extractACAdjustments(actor) {
@@ -637,6 +751,74 @@ const SKILL_LABELS = {
   prf: "Performance", per: "Persuasion", rel: "Religion", sle: "Sleight of Hand",
   ste: "Stealth", sur: "Survival"
 };
+
+function collectSkillRollModes(actor) {
+  const keys = Object.keys(SKILL_LABELS);
+  const out = {};
+  for (const k of keys) out[k] = 0;
+
+  const apply = (skillKey, value, mode) => {
+    if (!Object.prototype.hasOwnProperty.call(out, skillKey)) return;
+    out[skillKey] = applyNumericEffectMode(out[skillKey], value, mode);
+  };
+
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+
+      const rollModeMatch = key.match(/^system\.skills\.([a-z]{3})\.roll\.mode$/);
+      if (rollModeMatch) {
+        const val = tryNum(ch?.value);
+        if (Number.isFinite(val)) apply(rollModeMatch[1], val, mode);
+        continue;
+      }
+
+      const advMatch = key.match(/^flags\.midi-qol\.advantage\.skill\.(all|[a-z]{3})$/);
+      if (advMatch && isTruthyEffectValue(ch?.value)) {
+        if (advMatch[1] === "all") for (const sk of keys) apply(sk, 1, mode);
+        else apply(advMatch[1], 1, mode);
+        continue;
+      }
+
+      const disMatch = key.match(/^flags\.midi-qol\.disadvantage\.skill\.(all|[a-z]{3})$/);
+      if (disMatch && isTruthyEffectValue(ch?.value)) {
+        if (disMatch[1] === "all") for (const sk of keys) apply(sk, -1, mode);
+        else apply(disMatch[1], -1, mode);
+      }
+    }
+  }
+
+  for (const k of keys) {
+    if (out[k] > 0) out[k] = 1;
+    else if (out[k] < 0) out[k] = -1;
+    else out[k] = 0;
+  }
+
+  return out;
+}
+
+function skillModeBadge(mode) {
+  if (mode > 0) {
+    return `<span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-emerald-200/60 bg-emerald-500/75 text-[10px] font-bold text-white align-middle">A</span>`;
+  }
+  if (mode < 0) {
+    return `<span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-rose-200/60 bg-rose-500/75 text-[10px] font-bold text-white align-middle">D</span>`;
+  }
+  return "";
+}
+
+function renderSkillsGrid(actor) {
+  const modeBySkill = collectSkillRollModes(actor);
+  const rows = Object.keys(SKILL_LABELS).map((k) => {
+    const badge = skillModeBadge(modeBySkill[k] || 0);
+    const val = `${fmtSigned(skillBonus(actor, k))}${badge ? ` ${badge}` : ""}`;
+    return [SKILL_LABELS[k], val];
+  });
+  return kvGrid(rows);
+}
 
 function skillBonus(actor, key) {
   const sys = actor?.system || {};
@@ -1057,7 +1239,8 @@ function renderDnd5e(payload) {
   root.appendChild(section("Abilities", kvGrid(abilityRows)));
 
   const attr = sys?.attributes || {};
-  const movement = attr?.movement || {};
+  const movement = computeMovement(actor);
+  const senses = computeSenses(actor);
   const hp = attr?.hp || {};
   const pb = getProfBonus(actor);
   const acVal = computeAC(actor);
@@ -1067,14 +1250,14 @@ function renderDnd5e(payload) {
     ["Hit Points", `${hp?.value ?? "–"} / ${hp?.max ?? "–"}${hp?.temp ? ` (temp ${hp.temp})` : ""}`],
     ["Initiative", fmtSigned(abilities.dex.mod)],
     ["Proficiency Bonus", fmtSigned(pb)],
-    ["Speed", `walk ${movement?.walk ?? "–"}${movement?.fly ? `, fly ${movement.fly}` : ""}${movement?.swim ? `, swim ${movement.swim}` : ""}`],
+    ["Speed", formatMovement(movement)],
+    ["Senses", formatSenses(senses, attr?.senses?.special)],
     ["Passive Perception", passiveSkill(actor, "prc")],
   ];
   root.appendChild(section("Combat", kvGrid(combatRows)));
 
   // skills
-  const skillRows = Object.keys(SKILL_LABELS).map(k => [SKILL_LABELS[k], fmtSigned(skillBonus(actor, k))]);
-  root.appendChild(section("Skills", kvGrid(skillRows)));
+  root.appendChild(section("Skills", renderSkillsGrid(actor)));
   root.appendChild(section("Active Effects", renderActiveEffects(actor)));
 
   // items
