@@ -1,9 +1,7 @@
-// Foundry Character Vault – static viewer for exported Actor snapshots.
+// Foundry Character Vault – static viewer for exported Actor snapshots (dnd5e-first).
+// Zero server, zero listeners, maximum vibes.
 
-const SITE_BASE = new URL(window.location.href);
-if (!SITE_BASE.pathname.endsWith("/")) SITE_BASE.pathname += "/";
-
-const MANIFEST_URL = new URL("data/manifest.json", SITE_BASE).toString();
+const MANIFEST_URL = "./data/manifest.json";
 const LS_KEY = "fcv_local_actor_payloads_v1";
 
 const $ = (sel) => document.querySelector(sel);
@@ -17,415 +15,45 @@ const importBtn = $("#importBtn");
 const importFile = $("#importFile");
 const refreshBtn = $("#refresh");
 
-let allPayloads = [];
+let allPayloads = [];  // [{id, name, meta, payload, corpus}]
 let selectedId = null;
 
-function safeText(s) {
-  return (s ?? "").toString();
-}
-
-function norm(s) {
-  return safeText(s).toLowerCase().trim();
-}
-
-function nameKey(s) {
-  return norm(s).replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
-}
+// ----------------------------
+// small utils
+// ----------------------------
+function safeText(s) { return (s ?? "").toString(); }
+function norm(s) { return safeText(s).toLowerCase().trim(); }
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
 function fmtSigned(n) {
   const x = Number(n ?? 0);
-  return x >= 0 ? `+${x}` : `${x}`;
+  return (x >= 0 ? `+${x}` : `${x}`);
+}
+
+function tryNum(x) {
+  if (x === null || x === undefined) return null;
+  if (typeof x === "number" && Number.isFinite(x)) return x;
+  const s = safeText(x).trim();
+  if (!s) return null;
+  // accept "+2", "-1", "2"
+  if (/^[+-]?\d+(\.\d+)?$/.test(s)) return Number(s);
+  return null;
+}
+
+function parseBonusString(x) {
+  const n = tryNum(x);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function guessSystem(payload) {
-  return (
-    payload?.systemId ||
-    payload?.actor?.system?.id ||
-    payload?.actor?.systemId ||
-    "unknown"
-  );
+  return payload?.systemId || payload?.actor?.system?.id || payload?.actor?.systemId || "unknown";
 }
 
 function actorFromPayload(payload) {
   return payload?.actor || payload?.data?.actor || payload?.document || payload;
 }
 
-function resolveUrl(pathish) {
-  const cleaned = safeText(pathish).replace(/^\.\//, "");
-  return new URL(cleaned, SITE_BASE).toString();
-}
-
-// =======================
-// dnd5e derived maths
-// =======================
-function abilityMod(score) {
-  const s = Number(score);
-  if (!Number.isFinite(s)) return 0;
-  return Math.floor((s - 10) / 2);
-}
-
-function totalLevel(actor) {
-  const sys = actor?.system || {};
-  const items = actor?.items || [];
-  const classes = items.filter((i) => i?.type === "class");
-  const lvl = classes.reduce((a, c) => a + Number(c?.system?.levels ?? 0), 0);
-  return lvl || Number(sys?.details?.level ?? 0) || 0;
-}
-
-function proficiencyBonus(level) {
-  const l = Number(level);
-  if (!Number.isFinite(l) || l <= 0) return 0;
-  return 2 + Math.floor((l - 1) / 4);
-}
-
-function parseFlatBonus(v) {
-  if (v == null) return 0;
-  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-
-  const s = String(v).trim();
-  if (!s) return 0;
-
-  // Avoid interpreting dice (e.g., "1d4").
-  if (/[dD]\d/.test(s)) return 0;
-
-  const nums = s.match(/[+-]?\d+/g);
-  if (!nums) return 0;
-
-  return nums
-    .map((n) => Number(n))
-    .filter(Number.isFinite)
-    .reduce((a, b) => a + b, 0);
-}
-
-function profComponent(rank, prof) {
-  const r = Number(rank ?? 0);
-  if (!Number.isFinite(r) || r <= 0) return 0;
-
-  if (r === 0.5) return Math.floor(prof / 2);
-  if (r === 1) return prof;
-  if (r === 2) return 2 * prof;
-
-  return Math.floor(r * prof);
-}
-
-function dnd5eDerived(actor) {
-  const sys = actor?.system || {};
-  const level = totalLevel(actor);
-  const prof = proficiencyBonus(level);
-
-  const abilities = sys?.abilities || {};
-  const abilityMods = {
-    str: abilityMod(abilities?.str?.value),
-    dex: abilityMod(abilities?.dex?.value),
-    con: abilityMod(abilities?.con?.value),
-    int: abilityMod(abilities?.int?.value),
-    wis: abilityMod(abilities?.wis?.value),
-    cha: abilityMod(abilities?.cha?.value),
-  };
-
-  const skills = sys?.skills || {};
-  const skillTotals = {};
-  for (const [k, sk] of Object.entries(skills)) {
-    const ability = sk?.ability;
-    const base = ability && abilityMods[ability] != null ? abilityMods[ability] : 0;
-    const profPart = profComponent(sk?.value, prof);
-
-    const bonus =
-      parseFlatBonus(sk?.bonuses?.check) +
-      parseFlatBonus(sys?.bonuses?.abilities?.skill) +
-      parseFlatBonus(sys?.bonuses?.skills?.check);
-
-    skillTotals[k] = base + profPart + bonus;
-  }
-
-  const passivePrc =
-    10 +
-    (skillTotals?.prc ?? 0) +
-    parseFlatBonus(skills?.prc?.bonuses?.passive) +
-    parseFlatBonus(sys?.bonuses?.skills?.passive);
-
-  return { level, prof, abilityMods, skillTotals, passivePrc };
-}
-
-// =======================
-// AC computation (dnd5e)
-// =======================
-const AE_MODES = {
-  CUSTOM: 0,
-  MULTIPLY: 1,
-  ADD: 2,
-  DOWNGRADE: 3,
-  UPGRADE: 4,
-  OVERRIDE: 5,
-};
-
-function isItemActiveForBonuses(item) {
-  const s = item?.system || {};
-  const equipped = !!s?.equipped;
-  const attuned = Number(s?.attunement ?? 0) === 2; // 2 usually means attuned
-  return equipped || attuned;
-}
-
-function collectTransferEffects(actor) {
-  const out = [];
-
-  const actorEffects = actor?.effects;
-  if (Array.isArray(actorEffects)) out.push(...actorEffects);
-
-  const items = actor?.items || [];
-  for (const it of items) {
-    if (!isItemActiveForBonuses(it)) continue;
-    const effects = it?.effects;
-    if (!Array.isArray(effects)) continue;
-
-    for (const ef of effects) {
-      if (!ef || ef.disabled) continue;
-      const transfer = !!ef.transfer || !!ef?.flags?.dae?.transfer;
-      if (!transfer) continue;
-      out.push(ef);
-    }
-  }
-
-  return out;
-}
-
-function extractACFromEffects(actor) {
-  // Looks only for additive/override AC modifications.
-  // This is intentionally narrow: we want “ring +1 AC” type stuff, not a full AE engine.
-  let add = 0;
-  let override = null;
-
-  const effects = collectTransferEffects(actor);
-
-  for (const ef of effects) {
-    const changes = ef?.changes;
-    if (!Array.isArray(changes)) continue;
-
-    for (const ch of changes) {
-      const keyRaw = safeText(ch?.key);
-      if (!keyRaw) continue;
-
-      // Normalise older schema keys that start with data.
-      const key = keyRaw.replace(/^data\./, "system.");
-
-      const mode = Number(ch?.mode ?? AE_MODES.CUSTOM);
-      const val = parseFlatBonus(ch?.value);
-
-      // common targets
-      const isACValue = /system\.attributes\.ac\.(value|flat)$/i.test(key);
-      const isACBonus = /system\.attributes\.ac\.bonus$/i.test(key);
-
-      if (isACValue) {
-        if (mode === AE_MODES.OVERRIDE) override = val;
-        else if (mode === AE_MODES.ADD) add += val;
-      } else if (isACBonus) {
-        if (mode === AE_MODES.ADD) add += val;
-        else if (mode === AE_MODES.OVERRIDE) add = val;
-      }
-    }
-  }
-
-  return { add, override };
-}
-
-function getArmorMagicBonus(item) {
-  const a = item?.system?.armor || {};
-  const v =
-    a?.magicalBonus ??
-    a?.magicBonus ??
-    item?.system?.magicalBonus ??
-    item?.system?.magicBonus ??
-    0;
-  return Number(v) || 0;
-}
-
-function computeACArmorParts(actor) {
-  const items = actor?.items || [];
-  const equipped = items.filter((i) => !!i?.system?.equipped);
-
-  const armours = equipped.filter(
-    (i) =>
-      i?.type === "equipment" &&
-      Number.isFinite(i?.system?.armor?.value) &&
-      i?.system?.type?.value !== "shield"
-  );
-
-  const shields = equipped.filter(
-    (i) =>
-      i?.type === "equipment" &&
-      Number.isFinite(i?.system?.armor?.value) &&
-      i?.system?.type?.value === "shield"
-  );
-
-  // pick "best" armour by (base + magic)
-  const bestArmour = armours
-    .map((i) => {
-      const base = Number(i?.system?.armor?.value ?? 0);
-      const magic = getArmorMagicBonus(i);
-      return { item: i, total: base + magic };
-    })
-    .sort((a, b) => b.total - a.total)[0]?.item;
-
-  const armourBase = bestArmour ? Number(bestArmour.system.armor.value) : 10;
-  const armourMagic = bestArmour ? getArmorMagicBonus(bestArmour) : 0;
-  const armourTotal = armourBase + armourMagic;
-
-  const shieldTotal = shields.reduce((a, s) => {
-    const base = Number(s?.system?.armor?.value ?? 0);
-    const magic = getArmorMagicBonus(s);
-    return a + base + magic;
-  }, 0);
-
-  // This corresponds to @attributes.ac.armor in the vast majority of dnd5e setups.
-  const acArmor = armourTotal + shieldTotal;
-
-  return { bestArmour, armourTotal, shieldTotal, acArmor };
-}
-
-function computeAC(actor, derived) {
-  const sys = actor?.system || {};
-  const ac = sys?.attributes?.ac || {};
-
-  // If the export included resolved values, prefer them.
-  if (Number.isFinite(ac?.value)) return Number(ac.value);
-  if (Number.isFinite(ac?.flat)) return Number(ac.flat);
-
-  const { bestArmour, acArmor } = computeACArmorParts(actor);
-
-  const dexFull = derived?.abilityMods?.dex ?? 0;
-
-  // Armour Dex cap (for heuristic and for @attributes.ac.dex token)
-  const dexCap = bestArmour ? bestArmour?.system?.armor?.dex : null;
-  const dexCapped =
-    dexCap == null || dexCap === "" ? dexFull : Math.min(dexFull, Number(dexCap) || 0);
-
-  // Bonuses from system fields + transferable active effects
-  const { add: effectAdd, override: effectOverride } = extractACFromEffects(actor);
-  const sysBonus =
-    parseFlatBonus(ac?.bonus) +
-    parseFlatBonus(sys?.bonuses?.ac?.value) +
-    parseFlatBonus(sys?.bonuses?.ac?.bonus) +
-    parseFlatBonus(sys?.bonuses?.ac?.all);
-
-  const totalBonus = sysBonus + effectAdd;
-
-  // If an effect explicitly overrides AC, obey it (and still add bonus if present).
-  if (Number.isFinite(effectOverride)) return Number(effectOverride) + totalBonus;
-
-  // Custom formula path (safe)
-  // IMPORTANT: @abilities.dex.mod = FULL Dex mod, never capped.
-  // If you want capped Dex, formula should use @attributes.ac.dex.
-  if (ac?.calc === "custom" && typeof ac?.formula === "string") {
-    const ctx = {
-      "@attributes.ac.armor": acArmor,
-      "@attributes.ac.shield": computeACArmorParts(actor).shieldTotal,
-      "@attributes.ac.base": 10,
-      "@attributes.ac.dex": dexCapped,
-      "@attributes.ac.bonus": totalBonus,
-
-      "@abilities.str.mod": derived?.abilityMods?.str ?? 0,
-      "@abilities.dex.mod": dexFull,
-      "@abilities.con.mod": derived?.abilityMods?.con ?? 0,
-      "@abilities.int.mod": derived?.abilityMods?.int ?? 0,
-      "@abilities.wis.mod": derived?.abilityMods?.wis ?? 0,
-      "@abilities.cha.mod": derived?.abilityMods?.cha ?? 0,
-
-      "@attributes.prof": derived?.prof ?? 0,
-    };
-
-    let expr = ac.formula;
-
-    for (const [token, val] of Object.entries(ctx)) {
-      expr = expr.split(token).join(String(Number(val ?? 0)));
-    }
-
-    // If unknown tokens remain, expr will contain letters and fail the safety check.
-    if (/^[0-9+\-*/().\s]+$/.test(expr)) {
-      try {
-        // eslint-disable-next-line no-new-func
-        let n = Function(`return (${expr});`)();
-        if (Number.isFinite(n)) {
-          // Foundry often applies ac.bonus separately; if the formula didn't reference it,
-          // add it here so rings/cloaks/etc still appear.
-          if (!ac.formula.includes("@attributes.ac.bonus")) n += totalBonus;
-          return n;
-        }
-      } catch {
-        // fall through
-      }
-    }
-    // Fall back to heuristic if formula can't be safely evaluated.
-  }
-
-  // Heuristic default: @attributes.ac.armor + capped Dex + bonuses
-  return acArmor + dexCapped + totalBonus;
-}
-
-// =======================
-// Spells prepared state + filter
-// =======================
-function preparedState(spell) {
-  const s = spell?.system || {};
-  // v4: 0/1/2
-  if (s?.prepared === 0 || s?.prepared === 1 || s?.prepared === 2) return s.prepared;
-
-  // older schema
-  const mode = s?.preparation?.mode;
-  if (mode === "always") return 2;
-  if (mode === "prepared") return s?.preparation?.prepared ? 1 : 0;
-
-  return null;
-}
-
-function spellPreparedLabel(spell) {
-  const st = preparedState(spell);
-  if (st === 2) return "Always prepared";
-  if (st === 1) return "Prepared";
-  if (st === 0) return "Not prepared";
-  return "";
-}
-
-// =======================
-// Feature filtering
-// =======================
-const FILTERED_FEATURES = new Set(
-  [
-    "hide",
-    "search",
-    "attack",
-    "check cover",
-    "dash",
-    "disengage",
-    "grapple",
-    "knock out",
-    "magic",
-    "ready",
-    "ready spell",
-    "stabilise",
-    "study",
-    "underwater",
-    "dodge",
-    "fall",
-    "help",
-    "influence",
-    "mount",
-    "ready action",
-    "shove",
-    "squeeze",
-    "suffocation",
-  ].map(nameKey)
-);
-
-function shouldHideFeature(item) {
-  return FILTERED_FEATURES.has(nameKey(item?.name));
-}
-
-// =======================
-// UI helpers
-// =======================
-function setStatus(msg) {
-  statusEl.textContent = msg;
-}
+function setStatus(msg) { statusEl.textContent = msg; }
 
 function clearSheet() {
   sheetEl.innerHTML = `<div class="text-slate-300">Select a character, or hit <span class="text-white font-semibold">Import JSON</span>.</div>`;
@@ -477,141 +105,337 @@ function kvGrid(rows) {
 function listCards(items, subtitleFn) {
   const wrap = document.createElement("div");
   wrap.className = "grid grid-cols-1 md:grid-cols-2 gap-2";
-
   for (const it of items) {
     const card = document.createElement("div");
     card.className = "rounded-2xl bg-slate-950/40 border border-white/10 p-3";
     const sub = subtitleFn ? subtitleFn(it) : "";
-    card.innerHTML = `<div class="font-medium">${safeText(it.name || "Unnamed")}</div>${
-      sub ? `<div class="text-xs text-slate-400 mt-1">${sub}</div>` : ""
-    }`;
+    card.innerHTML = `<div class="font-medium">${safeText(it.name || "Unnamed")}</div>${sub ? `<div class="text-xs text-slate-400 mt-1">${sub}</div>` : ""}`;
     wrap.appendChild(card);
   }
   return wrap;
 }
 
-function inventorySearchNode(gear) {
-  const wrap = document.createElement("div");
-  wrap.className = "flex flex-col gap-3";
-
-  const input = document.createElement("input");
-  input.type = "search";
-  input.placeholder = "Search inventory…";
-  input.className =
-    "w-full rounded-2xl bg-slate-950/40 border border-white/10 px-3 py-2 text-slate-100 " +
-    "placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-white/20";
-
-  const listWrap = document.createElement("div");
-
-  const render = () => {
-    const q = norm(input.value);
-    const filtered = !q ? gear : gear.filter((g) => norm(g?.name).includes(q));
-    listWrap.innerHTML = "";
-    listWrap.appendChild(
-      filtered.length
-        ? listCards(filtered, (g) => {
-            const qty = g?.system?.quantity;
-            const eq = g?.system?.equipped ? "equipped" : "";
-            return [`qty ${qty ?? 1}`, eq].filter(Boolean).join(" • ");
-          })
-        : document.createTextNode("No matching items.")
-    );
-  };
-
-  input.addEventListener("input", render);
-  wrap.appendChild(input);
-  wrap.appendChild(listWrap);
-  render();
-  return wrap;
+// ----------------------------
+// dnd5e maths
+// ----------------------------
+function abilityMod(score) {
+  const s = Number(score ?? 0);
+  if (!Number.isFinite(s)) return 0;
+  return Math.floor((s - 10) / 2);
 }
 
-function spellsFilterNode(spells) {
-  const wrap = document.createElement("div");
-  wrap.className = "flex flex-col gap-3";
-
-  const row = document.createElement("div");
-  row.className = "flex flex-col md:flex-row gap-2";
-
-  const select = document.createElement("select");
-  select.className =
-    "rounded-2xl bg-slate-950/40 border border-white/10 px-3 py-2 text-slate-100 " +
-    "focus:outline-none focus:ring-2 focus:ring-white/20";
-
-  const opts = [
-    ["all", "All spells"],
-    ["prepared", "Prepared (incl. always)"],
-    ["always", "Always prepared"],
-    ["not", "Not prepared"],
-  ];
-  for (const [v, label] of opts) {
-    const o = document.createElement("option");
-    o.value = v;
-    o.textContent = label;
-    select.appendChild(o);
-  }
-
-  row.appendChild(select);
-  wrap.appendChild(row);
-
-  const listWrap = document.createElement("div");
-  wrap.appendChild(listWrap);
-
-  const render = () => {
-    const mode = select.value;
-
-    const filtered = spells.filter((s) => {
-      const st = preparedState(s);
-      if (mode === "all") return true;
-      if (mode === "prepared") return st === 1 || st === 2;
-      if (mode === "always") return st === 2;
-      if (mode === "not") return st === 0;
-      return true;
-    });
-
-    listWrap.innerHTML = "";
-    listWrap.appendChild(
-      filtered.length
-        ? listCards(filtered, (s) => {
-            const lvl = s?.system?.level;
-            const school = s?.system?.school;
-            const prep = spellPreparedLabel(s);
-            return [lvl === 0 ? "Cantrip" : `Level ${lvl}`, school, prep].filter(Boolean).join(" • ");
-          })
-        : document.createTextNode("No spells match that filter.")
-    );
-  };
-
-  select.addEventListener("change", render);
-  render();
-  return wrap;
+function getClassLevel(actor) {
+  const items = actor?.items || [];
+  const classes = items.filter(i => i?.type === "class");
+  const fromClasses = classes.reduce((a, c) => a + Number(c?.system?.levels ?? 0), 0);
+  const fromDetails = Number(actor?.system?.details?.level ?? 0);
+  return (fromClasses || fromDetails || 0);
 }
 
-// =======================
-// Meta / search corpus
-// =======================
-function dnd5eMeta(actor) {
+function profBonusFromLevel(level) {
+  const lvl = Math.max(1, Number(level || 1));
+  return 2 + Math.floor((lvl - 1) / 4);
+}
+
+function getProfBonus(actor) {
   const sys = actor?.system || {};
-  const hp = sys?.attributes?.hp;
-  const init = sys?.attributes?.init;
+  const direct = tryNum(sys?.attributes?.prof);
+  if (Number.isFinite(direct)) return direct;
+  return profBonusFromLevel(getClassLevel(actor));
+}
+
+function getAbilities(actor) {
+  const abilities = actor?.system?.abilities || {};
+  const out = {};
+  for (const k of ["str","dex","con","int","wis","cha"]) {
+    const score = tryNum(abilities?.[k]?.value) ?? 0;
+    const mod = tryNum(abilities?.[k]?.mod);
+    out[k] = {
+      score,
+      mod: Number.isFinite(mod) ? mod : abilityMod(score),
+      label: safeText(abilities?.[k]?.label || k.toUpperCase()),
+    };
+  }
+  return out;
+}
+
+function getAllEffects(actor) {
+  const effects = [];
+  const actorEffects = actor?.effects || [];
+  for (const e of actorEffects) if (e && !e.disabled) effects.push(e);
 
   const items = actor?.items || [];
-  const classes = items.filter((i) => i?.type === "class");
-  const level = totalLevel(actor) || "";
-  const classNames = classes.map((c) => c?.name).filter(Boolean).join(", ");
+  for (const it of items) {
+    const ie = it?.effects || [];
+    for (const e of ie) {
+      if (!e || e.disabled) continue;
+      // for item effects, transfer false usually means "not applied to actor"
+      if (e.transfer === false) continue;
+      effects.push(e);
+    }
+  }
+  return effects;
+}
 
-  const derived = dnd5eDerived(actor);
-  const acValue = computeAC(actor, derived);
+const MODE_ADD = 2;
+const MODE_OVERRIDE = 5;
+
+// Pull only numeric changes that we can safely apply offline.
+function extractACAdjustments(actor) {
+  const adj = {
+    valueAdd: 0, valueOverride: null,
+    flatOverride: null,
+    bonusAdd: 0, bonusOverride: null,
+    armorAdd: 0, armorOverride: null,
+    baseAdd: 0, baseOverride: null,
+    dexAdd: 0, dexOverride: null,
+    shieldAdd: 0, shieldOverride: null,
+  };
+
+  const effects = getAllEffects(actor);
+
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key);
+      const mode = Number(ch?.mode ?? 0);
+
+      // We only trust plain numbers here.
+      const val = tryNum(ch?.value);
+      if (!Number.isFinite(val)) continue;
+
+      const apply = (field) => {
+        if (mode === MODE_OVERRIDE) adj[field + "Override"] = val;
+        else if (mode === MODE_ADD) adj[field + "Add"] += val;
+      };
+
+      if (key === "system.attributes.ac.value") apply("value");
+      else if (key === "system.attributes.ac.flat") adj.flatOverride = (mode === MODE_OVERRIDE ? val : (adj.flatOverride ?? 0) + val);
+      else if (key === "system.attributes.ac.bonus") apply("bonus");
+      else if (key === "system.attributes.ac.armor") apply("armor");
+      else if (key === "system.attributes.ac.base") apply("base");
+      else if (key === "system.attributes.ac.dex") apply("dex");
+      else if (key === "system.attributes.ac.shield") apply("shield");
+    }
+  }
+  return adj;
+}
+
+function isEquipped(it) {
+  return Boolean(it?.system?.equipped);
+}
+
+function isShield(it) {
+  const t = it?.system?.type?.value || it?.system?.type?.baseItem;
+  return t === "shield" || norm(it?.name) === "shield";
+}
+
+function getACArmorParts(actor) {
+  const items = actor?.items || [];
+
+  let bestArmor = null; // {base, magical, dexCap}
+  let shieldTotal = 0;
+
+  for (const it of items) {
+    if (it?.type !== "equipment") continue;
+    if (!isEquipped(it)) continue;
+
+    const armor = it?.system?.armor || {};
+    const base = tryNum(armor?.value);
+    if (!Number.isFinite(base)) continue;
+
+    const magical = tryNum(armor?.magicalBonus) ?? tryNum(it?.system?.magicalBonus) ?? 0;
+    const dexCap = (armor?.dex === null || armor?.dex === undefined) ? null : tryNum(armor?.dex);
+
+    if (isShield(it)) {
+      shieldTotal += (base + (magical || 0));
+    } else {
+      const candidate = { base: base + (magical || 0), dexCap };
+      if (!bestArmor || candidate.base > bestArmor.base) bestArmor = candidate;
+    }
+  }
 
   return {
-    line1: [classNames || sys?.details?.class || "Character", level ? `Lv ${level}` : ""]
-      .filter(Boolean)
-      .join(" • "),
-    line2: [
-      `AC ${Number.isFinite(acValue) ? acValue : "–"}`,
-      `HP ${hp?.value ?? "–"}/${hp?.max ?? "–"}`,
-      `PB ${fmtSigned(derived.prof)}`,
-    ].join("  ·  "),
-    init: init?.mod ?? init?.total ?? init?.value ?? derived?.abilityMods?.dex,
+    armorBase: bestArmor ? bestArmor.base : 10,
+    armorDexCap: bestArmor ? bestArmor.dexCap : null,
+    shieldTotal
+  };
+}
+
+// Safe-ish evaluation for Foundry-style formulas after token substitution.
+// Supports min/max/floor/ceil/round.
+function evalFormula(formula, ctx) {
+  let expr = safeText(formula).trim();
+  if (!expr) return null;
+
+  // Replace the longest tokens first to avoid accidental partial overlaps.
+  const keys = Object.keys(ctx).sort((a, b) => b.length - a.length);
+  for (const k of keys) {
+    expr = expr.split(k).join(String(ctx[k]));
+  }
+
+  // Normalise common helpers.
+  expr = expr
+    .replace(/\bmin\s*\(/gi, "Math.min(")
+    .replace(/\bmax\s*\(/gi, "Math.max(")
+    .replace(/\bfloor\s*\(/gi, "Math.floor(")
+    .replace(/\bceil\s*\(/gi, "Math.ceil(")
+    .replace(/\bround\s*\(/gi, "Math.round(");
+
+  // Reject anything that looks like code injection.
+  if (/[;{}[\]=:'"\\<>?`]/.test(expr)) return null;
+
+  // Only allow identifiers we explicitly tolerate.
+  const ids = expr.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
+  const ok = new Set(["Math", "min", "max", "floor", "ceil", "round"]);
+  for (const id of ids) {
+    if (!ok.has(id)) return null;
+  }
+
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = Function(`"use strict"; return (${expr});`);
+    const out = fn();
+    return Number.isFinite(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+function computeAC(actor) {
+  const sys = actor?.system || {};
+  const ac = sys?.attributes?.ac || {};
+
+  const abilities = getAbilities(actor);
+  const dexMod = abilities.dex.mod;
+
+  const parts = getACArmorParts(actor);
+  const adj = extractACAdjustments(actor);
+
+  // Armour-ish components (these feed @attributes.ac.armor, and our fallback).
+  let armorToken = parts.armorBase + parts.shieldTotal;
+  if (Number.isFinite(adj.armorOverride)) armorToken = adj.armorOverride;
+  armorToken += (adj.armorAdd || 0);
+
+  let shieldToken = parts.shieldTotal;
+  if (Number.isFinite(adj.shieldOverride)) shieldToken = adj.shieldOverride;
+  shieldToken += (adj.shieldAdd || 0);
+
+  let baseToken = 10;
+  if (Number.isFinite(adj.baseOverride)) baseToken = adj.baseOverride;
+  baseToken += (adj.baseAdd || 0);
+
+  // Dex contribution for @attributes.ac.dex (capped if armour says so).
+  const cap = parts.armorDexCap;
+  let dexToken = (Number.isFinite(cap) ? Math.min(dexMod, cap) : dexMod);
+  if (Number.isFinite(adj.dexOverride)) dexToken = adj.dexOverride;
+  dexToken += (adj.dexAdd || 0);
+
+  // Generic bonuses (rings, cloaks, effects, etc.).
+  // Some systems store this as string; we parse if numeric.
+  let bonusToken = parseBonusString(ac?.bonus);
+  if (Number.isFinite(adj.bonusOverride)) bonusToken = adj.bonusOverride;
+  bonusToken += (adj.bonusAdd || 0);
+
+  // Direct "add to AC value" effects (e.g., +2 to AC value) – treated as bonus.
+  bonusToken += (adj.valueAdd || 0);
+
+  const pb = getProfBonus(actor);
+
+  // 1) Custom formula gets first bite of the apple.
+  if (ac?.calc === "custom" && ac?.formula) {
+    const ctx = {
+      "@attributes.ac.armor": armorToken,
+      "@attributes.ac.base": baseToken,
+      "@attributes.ac.shield": shieldToken,
+      "@attributes.ac.dex": dexToken,
+      "@attributes.ac.bonus": bonusToken,
+      "@attributes.prof": pb,
+      "@prof": pb,
+      "@abilities.str.mod": abilities.str.mod,
+      "@abilities.dex.mod": abilities.dex.mod,
+      "@abilities.con.mod": abilities.con.mod,
+      "@abilities.int.mod": abilities.int.mod,
+      "@abilities.wis.mod": abilities.wis.mod,
+      "@abilities.cha.mod": abilities.cha.mod,
+    };
+
+    let val = evalFormula(ac.formula, ctx);
+    if (Number.isFinite(val)) {
+      // If the formula doesn't reference @attributes.ac.bonus, we add it.
+      // This keeps the common custom formula "@attributes.ac.armor+@abilities.dex.mod" correct,
+      // while still respecting formulas that *do* include ac.bonus.
+      if (!ac.formula.includes("@attributes.ac.bonus")) val += bonusToken;
+      return Math.round(val);
+    }
+    // If evaluation fails, we fall through to heuristics.
+  }
+
+  // 2) Flat overrides (rare but explicit).
+  if (Number.isFinite(adj.flatOverride)) return Math.round(adj.flatOverride + bonusToken);
+
+  // 3) Direct AC value override from effects (e.g., "your AC becomes 13").
+  if (Number.isFinite(adj.valueOverride)) return Math.round(adj.valueOverride + bonusToken);
+
+  // 4) If snapshot already has a numeric ac.value, trust it (and still add numeric bonuses we found).
+  const rawValue = tryNum(ac?.value);
+  if (Number.isFinite(rawValue)) return Math.round(rawValue + bonusToken);
+
+  // 5) Default: armour component + capped dex + bonuses.
+  return Math.round(armorToken + dexToken + bonusToken);
+}
+
+// ----------------------------
+// dnd5e display + filtering
+// ----------------------------
+const SKILL_LABELS = {
+  acr: "Acrobatics", ani: "Animal Handling", arc: "Arcana", ath: "Athletics",
+  dec: "Deception", his: "History", ins: "Insight", itm: "Intimidation",
+  inv: "Investigation", med: "Medicine", nat: "Nature", prc: "Perception",
+  prf: "Performance", per: "Persuasion", rel: "Religion", sle: "Sleight of Hand",
+  ste: "Stealth", sur: "Survival"
+};
+
+function skillBonus(actor, key) {
+  const sys = actor?.system || {};
+  const abilities = getAbilities(actor);
+  const pb = getProfBonus(actor);
+
+  const sk = sys?.skills?.[key] || {};
+  const abilityKey = sk?.ability || ({
+    acr:"dex", ani:"wis", arc:"int", ath:"str", dec:"cha", his:"int", ins:"wis", itm:"cha",
+    inv:"int", med:"wis", nat:"int", prc:"wis", prf:"cha", per:"cha", rel:"int", sle:"dex", ste:"dex", sur:"wis"
+  }[key] || "wis");
+
+  const aMod = abilities?.[abilityKey]?.mod ?? 0;
+  const val = tryNum(sk?.value) ?? 0; // 0 untrained, 0.5 half, 1 prof, 2 expertise
+  const profMult = (val === 2 ? 2 : (val === 1 ? 1 : (val === 0.5 ? 0.5 : 0)));
+  const misc = parseBonusString(sk?.bonuses?.check);
+
+  return aMod + (pb * profMult) + misc;
+}
+
+function passiveSkill(actor, key) {
+  const sys = actor?.system || {};
+  const sk = sys?.skills?.[key] || {};
+  const misc = parseBonusString(sk?.bonuses?.passive);
+  return 10 + skillBonus(actor, key) + misc;
+}
+
+function dnd5eMeta(actor) {
+  const sys = actor?.system || {};
+  const hp = sys?.attributes?.hp || {};
+  const items = actor?.items || [];
+  const classes = items.filter(i => i?.type === "class");
+  const level = getClassLevel(actor) || "";
+  const classNames = classes.map(c => c?.name).filter(Boolean).join(", ");
+
+  const acVal = computeAC(actor);
+  const pb = getProfBonus(actor);
+
+  return {
+    line1: [classNames || sys?.details?.class || "Character", level ? `Lv ${level}` : ""].filter(Boolean).join(" • "),
+    line2: [`AC ${acVal ?? "–"}`, `HP ${hp?.value ?? "–"}/${hp?.max ?? "–"}`, `PB ${fmtSigned(pb ?? 0)}`].join("  ·  ")
   };
 }
 
@@ -636,20 +460,138 @@ function extractSearchCorpus(payload) {
   bits.push(sys?.details?.class);
   bits.push(sys?.details?.race);
   bits.push(sys?.details?.background);
+
   for (const it of items) bits.push(it?.name);
+
+  const abilities = sys?.abilities || {};
+  Object.keys(abilities).forEach(k => bits.push(k, abilities[k]?.label));
+  const skills = sys?.skills || {};
+  Object.keys(skills).forEach(k => bits.push(k, SKILL_LABELS[k] || skills[k]?.label));
 
   return norm(bits.filter(Boolean).join(" "));
 }
 
-// =======================
-// Rendering
-// =======================
+function rosterItem(payload) {
+  const actor = actorFromPayload(payload);
+  const meta = getMeta(payload);
+
+  const tpl = $("#rosterItemTpl");
+  const node = tpl.content.firstElementChild.cloneNode(true);
+
+  node.dataset.id = actor?._id || payload?.id || crypto.randomUUID();
+  node.querySelector("img").src = actor?.img || "https://dummyimage.com/160x160/111827/ffffff&text=%E2%98%85";
+  node.querySelector(".name").textContent = actor?.name || "Unnamed";
+  node.querySelector(".meta").textContent = meta.line1;
+
+  node.addEventListener("click", () => selectActor(node.dataset.id));
+  return node;
+}
+
+const FEATURE_BLACKLIST = new Set([
+  "hide","search","attack","check cover","dash","disengage","grapple","knock out","magic","ready","ready spell",
+  "stabilise","study","underwater","dodge","fall","help","influence","mount","ready action","shove","squeeze","suffocation"
+].map(x => norm(x)));
+
+function spellPreparedTag(spell) {
+  const p = tryNum(spell?.system?.prepared);
+  if (p === 2) return "Always prepared";
+  if (p === 1) return "Prepared";
+  return "Not prepared";
+}
+
+function renderInventoryWithSearch(gear) {
+  const wrap = document.createElement("div");
+  wrap.className = "space-y-3";
+
+  const controls = document.createElement("div");
+  controls.className = "flex flex-col md:flex-row md:items-center gap-2";
+  controls.innerHTML = `
+    <input class="w-full md:w-96 rounded-2xl bg-white/5 border border-white/10 px-4 py-2 outline-none focus:ring-2 focus:ring-indigo-400/40"
+           placeholder="Search this inventory…" />
+    <div class="text-xs text-slate-400 md:ml-auto" id="count"></div>
+  `;
+  wrap.appendChild(controls);
+
+  const input = controls.querySelector("input");
+  const count = controls.querySelector("#count");
+
+  const listWrap = document.createElement("div");
+  wrap.appendChild(listWrap);
+
+  const render = () => {
+    const q = norm(input.value);
+    const filtered = !q ? gear : gear.filter(g => norm(g?.name).includes(q));
+    count.textContent = `${filtered.length} item(s)`;
+    listWrap.innerHTML = "";
+    listWrap.appendChild(listCards(filtered, (g) => {
+      const qty = tryNum(g?.system?.quantity) ?? 1;
+      const eq = g?.system?.equipped ? "equipped" : "";
+      const att = g?.system?.attunement ? "attunement" : "";
+      return [`qty ${qty}`, eq, att].filter(Boolean).join(" • ");
+    }));
+  };
+
+  input.addEventListener("input", render);
+  render();
+
+  return wrap;
+}
+
+function renderSpellsWithFilter(spells) {
+  const wrap = document.createElement("div");
+  wrap.className = "space-y-3";
+
+  const controls = document.createElement("div");
+  controls.className = "flex flex-col md:flex-row md:items-center gap-2";
+  controls.innerHTML = `
+    <div class="text-xs text-slate-400">Filter:</div>
+    <select class="w-full md:w-64 rounded-2xl bg-white/5 border border-white/10 px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-400/40">
+      <option value="all">All spells</option>
+      <option value="prepared">Prepared (incl. always)</option>
+      <option value="always">Always prepared</option>
+      <option value="not">Not prepared</option>
+    </select>
+    <div class="text-xs text-slate-400 md:ml-auto" id="count"></div>
+  `;
+  wrap.appendChild(controls);
+
+  const sel = controls.querySelector("select");
+  const count = controls.querySelector("#count");
+
+  const listWrap = document.createElement("div");
+  wrap.appendChild(listWrap);
+
+  const render = () => {
+    const mode = sel.value;
+    const filtered = spells.filter(s => {
+      const p = tryNum(s?.system?.prepared) ?? 0;
+      if (mode === "prepared") return p === 1 || p === 2;
+      if (mode === "always") return p === 2;
+      if (mode === "not") return p === 0;
+      return true;
+    });
+
+    count.textContent = `${filtered.length} spell(s)`;
+
+    listWrap.innerHTML = "";
+    listWrap.appendChild(listCards(filtered, (s) => {
+      const lvl = tryNum(s?.system?.level);
+      const school = s?.system?.school;
+      const tag = spellPreparedTag(s);
+      return [lvl === 0 ? "Cantrip" : `Level ${lvl}`, school, tag].filter(Boolean).join(" • ");
+    }));
+  };
+
+  sel.addEventListener("change", render);
+  render();
+
+  return wrap;
+}
+
 function renderDnd5e(payload) {
   const actor = actorFromPayload(payload);
   const sys = actor?.system || {};
   const meta = dnd5eMeta(actor);
-  const derived = dnd5eDerived(actor);
-  const acValue = computeAC(actor, derived);
 
   const root = document.createElement("div");
   root.className = "flex flex-col gap-4";
@@ -674,91 +616,62 @@ function renderDnd5e(payload) {
   const race = sys?.details?.race;
   const bg = sys?.details?.background;
   const align = sys?.details?.alignment;
-  [race, bg, align].filter(Boolean).forEach((x) => pills.appendChild(pill(x)));
+  [race, bg, align].filter(Boolean).forEach(x => pills.appendChild(pill(x)));
 
   root.appendChild(hero);
 
-  // Abilities
-  const abilities = sys?.abilities || {};
+  const abilities = getAbilities(actor);
   const abilityRows = [
-    ["STR", `${abilities?.str?.value ?? "–"} (${fmtSigned(derived.abilityMods.str)})`],
-    ["DEX", `${abilities?.dex?.value ?? "–"} (${fmtSigned(derived.abilityMods.dex)})`],
-    ["CON", `${abilities?.con?.value ?? "–"} (${fmtSigned(derived.abilityMods.con)})`],
-    ["INT", `${abilities?.int?.value ?? "–"} (${fmtSigned(derived.abilityMods.int)})`],
-    ["WIS", `${abilities?.wis?.value ?? "–"} (${fmtSigned(derived.abilityMods.wis)})`],
-    ["CHA", `${abilities?.cha?.value ?? "–"} (${fmtSigned(derived.abilityMods.cha)})`],
+    ["STR", `${abilities.str.score} (${fmtSigned(abilities.str.mod)})`],
+    ["DEX", `${abilities.dex.score} (${fmtSigned(abilities.dex.mod)})`],
+    ["CON", `${abilities.con.score} (${fmtSigned(abilities.con.mod)})`],
+    ["INT", `${abilities.int.score} (${fmtSigned(abilities.int.mod)})`],
+    ["WIS", `${abilities.wis.score} (${fmtSigned(abilities.wis.mod)})`],
+    ["CHA", `${abilities.cha.score} (${fmtSigned(abilities.cha.mod)})`],
   ];
   root.appendChild(section("Abilities", kvGrid(abilityRows)));
 
-  // Combat
   const attr = sys?.attributes || {};
   const movement = attr?.movement || {};
+  const hp = attr?.hp || {};
+  const pb = getProfBonus(actor);
+  const acVal = computeAC(actor);
+
   const combatRows = [
-    ["Armour Class", Number.isFinite(acValue) ? acValue : "–"],
-    [
-      "Hit Points",
-      `${attr?.hp?.value ?? "–"} / ${attr?.hp?.max ?? "–"}${attr?.hp?.temp ? ` (temp ${attr?.hp?.temp})` : ""}`,
-    ],
-    ["Initiative", fmtSigned(attr?.init?.mod ?? attr?.init?.total ?? attr?.init ?? derived.abilityMods.dex)],
-    ["Proficiency Bonus", fmtSigned(derived.prof)],
-    [
-      "Speed",
-      `walk ${movement?.walk ?? "–"}${movement?.fly ? `, fly ${movement.fly}` : ""}${movement?.swim ? `, swim ${movement.swim}` : ""}`,
-    ],
-    ["Passive Perception", Number.isFinite(derived.passivePrc) ? derived.passivePrc : "–"],
+    ["Armour Class", acVal ?? "–"],
+    ["Hit Points", `${hp?.value ?? "–"} / ${hp?.max ?? "–"}${hp?.temp ? ` (temp ${hp.temp})` : ""}`],
+    ["Initiative", fmtSigned(abilities.dex.mod)],
+    ["Proficiency Bonus", fmtSigned(pb)],
+    ["Speed", `walk ${movement?.walk ?? "–"}${movement?.fly ? `, fly ${movement.fly}` : ""}${movement?.swim ? `, swim ${movement.swim}` : ""}`],
+    ["Passive Perception", passiveSkill(actor, "prc")],
   ];
   root.appendChild(section("Combat", kvGrid(combatRows)));
 
-  // Skills
-  const skillLabels = {
-    acr: "Acrobatics",
-    ani: "Animal Handling",
-    arc: "Arcana",
-    ath: "Athletics",
-    dec: "Deception",
-    his: "History",
-    ins: "Insight",
-    itm: "Intimidation",
-    inv: "Investigation",
-    med: "Medicine",
-    nat: "Nature",
-    prc: "Perception",
-    prf: "Performance",
-    per: "Persuasion",
-    rel: "Religion",
-    sle: "Sleight of Hand",
-    ste: "Stealth",
-    sur: "Survival",
-  };
-  const skillRows = Object.keys(skillLabels).map((k) => [skillLabels[k], fmtSigned(derived.skillTotals?.[k] ?? 0)]);
+  // skills
+  const skillRows = Object.keys(SKILL_LABELS).map(k => [SKILL_LABELS[k], fmtSigned(skillBonus(actor, k))]);
   root.appendChild(section("Skills", kvGrid(skillRows)));
 
-  // Items
+  // items
   const items = actor?.items || [];
   const spells = items
-    .filter((i) => i?.type === "spell")
-    .sort((a, b) => safeText(a.name).localeCompare(safeText(b.name)));
+    .filter(i => i?.type === "spell")
+    .sort((a,b)=> safeText(a.name).localeCompare(safeText(b.name)));
 
   const feats = items
-    .filter((i) => i?.type === "feat")
-    .sort((a, b) => safeText(a.name).localeCompare(safeText(b.name)));
+    .filter(i => i?.type === "feat")
+    .filter(f => !FEATURE_BLACKLIST.has(norm(f?.name)))
+    .sort((a,b)=> safeText(a.name).localeCompare(safeText(b.name)));
 
-  const gearTypes = new Set(["weapon", "equipment", "consumable", "tool", "loot", "backpack", "container"]);
+  const gearTypes = new Set(["weapon","equipment","consumable","tool","loot","backpack"]);
   const gear = items
-    .filter((i) => gearTypes.has(i?.type))
-    .sort((a, b) => safeText(a.name).localeCompare(safeText(b.name)));
+    .filter(i => gearTypes.has(i?.type))
+    .sort((a,b)=> safeText(a.name).localeCompare(safeText(b.name)));
 
-  // Spells – filterable by prepared status
-  root.appendChild(section("Spells", spells.length ? spellsFilterNode(spells) : document.createTextNode("No spells exported.")));
+  root.appendChild(section("Spells", spells.length ? renderSpellsWithFilter(spells) : document.createTextNode("No spells exported.")));
+  root.appendChild(section("Features", feats.length ? listCards(feats) : document.createTextNode("No features exported.")));
+  root.appendChild(section("Inventory", gear.length ? renderInventoryWithSearch(gear) : document.createTextNode("No inventory exported.")));
 
-  // Features – filter out common actions
-  const cleanedFeats = feats.filter((f) => !shouldHideFeature(f));
-  root.appendChild(section("Features", cleanedFeats.length ? listCards(cleanedFeats) : document.createTextNode("No features exported.")));
-
-  // Inventory – per-sheet search
-  root.appendChild(section("Inventory", gear.length ? inventorySearchNode(gear) : document.createTextNode("No inventory exported.")));
-
-  // Biography
+  // notes
   const bio = sys?.details?.biography?.value || sys?.details?.biography || "";
   const notes = document.createElement("div");
   notes.className = "prose prose-invert max-w-none text-slate-200/90";
@@ -783,15 +696,14 @@ function renderUnknown(payload) {
       <div class="min-w-0 flex-1">
         <h2 class="text-2xl font-semibold tracking-tight truncate">${safeText(actor?.name)}</h2>
         <div class="mt-1 text-slate-300">System: <span class="text-white font-medium">${sysId}</span></div>
-        <div class="mt-3 text-slate-300/90">Rich rendering is implemented for dnd5e. Other systems show a raw snapshot.</div>
+        <div class="mt-3 text-slate-300/90">This viewer has rich rendering for dnd5e. Other systems show raw snapshot.</div>
       </div>
     </div>
   `;
   root.appendChild(hero);
 
   const pre = document.createElement("pre");
-  pre.className =
-    "text-xs whitespace-pre-wrap break-words rounded-3xl bg-slate-950/50 border border-white/10 p-4 max-h-[60vh] overflow-auto scrollbar";
+  pre.className = "text-xs whitespace-pre-wrap break-words rounded-3xl bg-slate-950/50 border border-white/10 p-4 max-h-[60vh] overflow-auto scrollbar";
   pre.textContent = JSON.stringify(payload, null, 2);
 
   root.appendChild(section("Raw data", pre));
@@ -804,26 +716,9 @@ function renderSheet(payload) {
   return renderUnknown(payload);
 }
 
-// =======================
-// Roster rendering / selection
-// =======================
-function rosterItem(payload) {
-  const actor = actorFromPayload(payload);
-  const meta = getMeta(payload);
-
-  const tpl = $("#rosterItemTpl");
-  const node = tpl.content.firstElementChild.cloneNode(true);
-
-  node.dataset.id = actor?._id || payload?.id || crypto.randomUUID();
-  node.querySelector("img").src =
-    actor?.img || "https://dummyimage.com/160x160/111827/ffffff&text=%E2%98%85";
-  node.querySelector(".name").textContent = actor?.name || "Unnamed";
-  node.querySelector(".meta").textContent = meta.line1;
-
-  node.addEventListener("click", () => selectActor(node.dataset.id));
-  return node;
-}
-
+// ----------------------------
+// roster + global search
+// ----------------------------
 function paintRoster(payloads) {
   rosterEl.innerHTML = "";
   const frag = document.createDocumentFragment();
@@ -838,10 +733,10 @@ function paintRoster(payloads) {
 
 function selectActor(id) {
   selectedId = id;
-  const found = allPayloads.find((x) => (actorFromPayload(x.payload)?._id || x.id) === id);
+  const found = allPayloads.find(x => (actorFromPayload(x.payload)?._id || x.id) === id);
   if (!found) return;
 
-  rosterEl.querySelectorAll("button[data-id]").forEach((b) => {
+  rosterEl.querySelectorAll("button[data-id]").forEach(b => {
     b.classList.toggle("bg-white/10", b.dataset.id === id);
   });
 
@@ -849,29 +744,14 @@ function selectActor(id) {
   sheetEl.appendChild(renderSheet(found.payload));
 }
 
-function filterRosterBySearch() {
-  const q = norm(searchEl.value);
-  const filtered = !q ? allPayloads : allPayloads.filter((x) => x.corpus.includes(q));
-  paintRoster(filtered.map((x) => x.payload));
-
-  if (selectedId) {
-    const still = filtered.some((p) => (actorFromPayload(p.payload)?._id || p.id) === selectedId);
-    if (!still) clearSheet();
-  }
-}
-
-// =======================
-// Data loading
-// =======================
 async function loadManifestPayloads() {
   const res = await fetch(MANIFEST_URL, { cache: "no-store" });
   if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status}`);
-  const manifest = await res.json();
+  const manifest = await res.json(); // [{file,name?}]
 
   const payloads = [];
   for (const entry of manifest) {
-    const url = resolveUrl(entry.file);
-    const r = await fetch(url, { cache: "no-store" });
+    const r = await fetch(entry.file, { cache: "no-store" });
     if (!r.ok) continue;
     const payload = await r.json();
     payloads.push(payload);
@@ -894,8 +774,20 @@ function saveLocalPayloads(payloads) {
   localStorage.setItem(LS_KEY, JSON.stringify(payloads));
 }
 
+function applyGlobalSearch() {
+  const q = norm(searchEl.value);
+  const filtered = !q ? allPayloads : allPayloads.filter(x => x.corpus.includes(q));
+  paintRoster(filtered.map(x => x.payload));
+
+  // if selected filtered out, clear
+  if (selectedId) {
+    const still = filtered.some(p => (actorFromPayload(p.payload)?._id || p.id) === selectedId);
+    if (!still) clearSheet();
+  }
+}
+
 async function initialise() {
-  setStatus("Loading manifest…");
+  setStatus("Loading…");
   let manifestPayloads = [];
   try {
     manifestPayloads = await loadManifestPayloads();
@@ -906,28 +798,25 @@ async function initialise() {
   const localPayloads = loadLocalPayloads();
   const merged = [...manifestPayloads, ...localPayloads];
 
-  allPayloads = merged
-    .map((payload) => {
-      const actor = actorFromPayload(payload);
-      const id = actor?._id || payload?.id || crypto.randomUUID();
-      const meta = getMeta(payload);
-      return {
-        id,
-        name: actor?.name || "Unnamed",
-        meta,
-        payload,
-        corpus: extractSearchCorpus(payload),
-      };
-    })
-    .sort((a, b) => safeText(a.name).localeCompare(safeText(b.name)));
+  allPayloads = merged.map((payload) => {
+    const actor = actorFromPayload(payload);
+    const id = actor?._id || payload?.id || crypto.randomUUID();
+    return {
+      id,
+      name: actor?.name || "Unnamed",
+      payload,
+      meta: getMeta(payload),
+      corpus: extractSearchCorpus(payload)
+    };
+  }).sort((a,b)=> safeText(a.name).localeCompare(safeText(b.name)));
 
-  paintRoster(allPayloads.map((x) => x.payload));
+  paintRoster(allPayloads.map(x => x.payload));
   setStatus(allPayloads.length ? `${allPayloads.length} character(s) loaded.` : "No data loaded – import JSON to begin.");
 }
 
-// =======================
-// Events
-// =======================
+// ----------------------------
+// import + events
+// ----------------------------
 importBtn.addEventListener("click", () => importFile.click());
 
 importFile.addEventListener("change", async () => {
@@ -953,6 +842,6 @@ importFile.addEventListener("change", async () => {
 });
 
 refreshBtn.addEventListener("click", initialise);
-searchEl.addEventListener("input", filterRosterBySearch);
+searchEl.addEventListener("input", applyGlobalSearch);
 
 initialise();
