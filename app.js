@@ -2025,7 +2025,7 @@ function rosterItem(entry) {
 
 const FEATURE_BLACKLIST = new Set([
   "hide","search","attack","check cover","dash","disengage","grapple","knock out","magic","ready","ready spell",
-  "stabilise","study","underwater","dodge","fall","help","influence","mount","ready action","shove","squeeze","suffocation"
+  "stabilise","stabilize","jump","study","underwater","dodge","fall","help","influence","mount","ready action","shove","squeeze","suffocation"
 ].map(x => norm(x)));
 
 function spellPreparedTag(spell) {
