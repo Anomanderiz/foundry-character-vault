@@ -82,7 +82,7 @@ function actorFromPayload(payload) {
   return payload?.actor || payload?.data?.actor || payload?.document || payload;
 }
 
-const CRIT_COIN_STORAGE_PREFIX = "fcv.crit-coin.v2.";
+const CRIT_COIN_ITEM_NAME = "crit coin";
 
 function actorHasInspiration(actor) {
   const direct = actor?.system?.attributes?.inspiration;
@@ -93,48 +93,15 @@ function actorHasInspiration(actor) {
   return s === "true" || s === "yes" || s === "on";
 }
 
-function critCoinStorageKey(actor) {
-  // Prefer name-based keying so values survive exports where internal IDs can change.
-  const nameKey = wordsName(actor?.name);
-  if (nameKey) return `${CRIT_COIN_STORAGE_PREFIX}${nameKey}`;
-  const id = safeText(actor?._id || actor?.id || "unknown").trim() || "unknown";
-  return `${CRIT_COIN_STORAGE_PREFIX}${id}`;
-}
-
-function legacyCritCoinStorageKey(actor) {
-  const id = safeText(actor?._id || actor?.id || actor?.name || "unknown").trim() || "unknown";
-  return `fcv.crit-coin.${id}`;
-}
-
-function readCritCoin(actor) {
-  const parseStoredValue = (raw) => {
-    const n = Math.floor(Number(raw));
-    return Number.isFinite(n) && n > 0 ? n : 0;
-  };
-
-  const key = critCoinStorageKey(actor);
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw !== null) return parseStoredValue(raw);
-
-    // One-time compatibility read for older key format.
-    const legacyRaw = localStorage.getItem(legacyCritCoinStorageKey(actor));
-    const legacyVal = parseStoredValue(legacyRaw);
-    if (legacyVal > 0) localStorage.setItem(key, String(legacyVal));
-    return legacyVal;
-  } catch {
-    return 0;
+function critCoinCount(actor) {
+  const items = actor?.items || [];
+  let total = 0;
+  for (const it of items) {
+    if (norm(it?.name) !== CRIT_COIN_ITEM_NAME) continue;
+    const qty = Math.floor(Number(tryNum(it?.system?.quantity) ?? 0));
+    if (Number.isFinite(qty) && qty > 0) total += qty;
   }
-}
-
-function writeCritCoin(actor, value) {
-  const key = critCoinStorageKey(actor);
-  const safe = Math.max(0, Math.floor(Number(value) || 0));
-  try {
-    localStorage.setItem(key, String(safe));
-  } catch {
-    // Ignore storage failures; counter still works for the current render.
-  }
+  return Math.max(0, total);
 }
 
 function inspirationBadgeNode(actor) {
@@ -158,50 +125,18 @@ function inspirationBadgeNode(actor) {
 function critCoinControlNode(actor) {
   const el = document.createElement("div");
   el.className = "inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 px-2 py-1";
-  el.title = "Crit Coin tracker";
+  el.title = "Crit Coin count (read-only from inventory)";
 
   const label = document.createElement("span");
   label.className = "text-[10px] uppercase tracking-wide font-semibold text-slate-200";
   label.textContent = "Crit Coin";
 
-  const minus = document.createElement("button");
-  minus.type = "button";
-  minus.className = "h-5 w-5 rounded border border-white/20 bg-slate-900/70 text-slate-100 hover:bg-slate-800 transition";
-  minus.textContent = "-";
-  minus.setAttribute("aria-label", "Decrease Crit Coin");
-
   const valueEl = document.createElement("span");
   valueEl.className = "min-w-[1.5rem] text-center text-sm font-semibold text-amber-300";
-
-  const plus = document.createElement("button");
-  plus.type = "button";
-  plus.className = "h-5 w-5 rounded border border-white/20 bg-slate-900/70 text-slate-100 hover:bg-slate-800 transition";
-  plus.textContent = "+";
-  plus.setAttribute("aria-label", "Increase Crit Coin");
-
-  let value = readCritCoin(actor);
-  const paint = () => {
-    value = Math.max(0, Math.floor(Number(value) || 0));
-    valueEl.textContent = String(value);
-    writeCritCoin(actor, value);
-  };
-
-  minus.addEventListener("click", (ev) => {
-    ev.preventDefault();
-    value = Math.max(0, value - 1);
-    paint();
-  });
-  plus.addEventListener("click", (ev) => {
-    ev.preventDefault();
-    value += 1;
-    paint();
-  });
+  valueEl.textContent = String(critCoinCount(actor));
 
   el.appendChild(label);
-  el.appendChild(minus);
   el.appendChild(valueEl);
-  el.appendChild(plus);
-  paint();
 
   return el;
 }
