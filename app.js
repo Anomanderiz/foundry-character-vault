@@ -587,6 +587,134 @@ function getAbilities(actor) {
   return out;
 }
 
+const effectiveAbilityProfCache = new WeakMap();
+
+function computeEffectiveAbilityProf(actor) {
+  if (actor && effectiveAbilityProfCache.has(actor)) return effectiveAbilityProfCache.get(actor);
+
+  const abilityKeys = ["str", "dex", "con", "int", "wis", "cha"];
+  const base = getAbilities(actor);
+  const abilities = {};
+  for (const k of abilityKeys) {
+    abilities[k] = {
+      score: Number(base?.[k]?.score ?? 0),
+      mod: Number(base?.[k]?.mod ?? 0),
+      label: safeText(base?.[k]?.label || k.toUpperCase())
+    };
+  }
+
+  let prof = Number(getProfBonus(actor) ?? 0);
+  const effects = getAllEffects(actor);
+
+  const ctx = () => {
+    const out = {
+      "@prof": prof,
+      "@attributes.prof": prof
+    };
+    for (const k of abilityKeys) {
+      out[`@abilities.${k}.value`] = Number(abilities?.[k]?.score ?? 0);
+      out[`@abilities.${k}.mod`] = Number(abilities?.[k]?.mod ?? 0);
+    }
+    return out;
+  };
+
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+
+      const abilityMatch = key.match(/^system\.abilities\.(str|dex|con|int|wis|cha)\.(value|mod)$/);
+      if (abilityMatch) {
+        const ab = abilityMatch[1];
+        const field = abilityMatch[2];
+        const val = effectNumericValue(actor, ch?.value, ctx());
+        if (!Number.isFinite(val)) continue;
+
+        if (field === "value") {
+          const oldScore = Number(abilities?.[ab]?.score ?? 0);
+          const oldDerived = abilityMod(oldScore);
+          const newScore = applyNumericEffectMode(oldScore, val, mode);
+          abilities[ab].score = newScore;
+          const newDerived = abilityMod(newScore);
+          abilities[ab].mod = Number(abilities?.[ab]?.mod ?? 0) + (newDerived - oldDerived);
+        } else {
+          const oldMod = Number(abilities?.[ab]?.mod ?? 0);
+          abilities[ab].mod = applyNumericEffectMode(oldMod, val, mode);
+        }
+        continue;
+      }
+
+      if (key === "system.attributes.prof" || key === "system.attributes.proficiency") {
+        const val = effectNumericValue(actor, ch?.value, ctx());
+        if (!Number.isFinite(val)) continue;
+        prof = applyNumericEffectMode(prof, val, mode);
+      }
+    }
+  }
+
+  const result = { abilities, prof };
+  if (actor) effectiveAbilityProfCache.set(actor, result);
+  return result;
+}
+
+function getEffectiveAbilities(actor) {
+  return computeEffectiveAbilityProf(actor).abilities;
+}
+
+function getEffectiveProfBonus(actor) {
+  return computeEffectiveAbilityProf(actor).prof;
+}
+
+function actorFormulaContext(actor) {
+  const bundle = computeEffectiveAbilityProf(actor);
+  const ctx = {
+    "@prof": Number(bundle?.prof ?? 0),
+    "@attributes.prof": Number(bundle?.prof ?? 0)
+  };
+  for (const k of ["str", "dex", "con", "int", "wis", "cha"]) {
+    ctx[`@abilities.${k}.value`] = Number(bundle?.abilities?.[k]?.score ?? 0);
+    ctx[`@abilities.${k}.mod`] = Number(bundle?.abilities?.[k]?.mod ?? 0);
+  }
+  return ctx;
+}
+
+function effectMathContext(actor, extra = {}) {
+  const abilities = getAbilities(actor);
+  const hp = actor?.system?.attributes?.hp || {};
+  const prof = getProfBonus(actor);
+  const ctx = {
+    "@prof": prof,
+    "@attributes.prof": prof,
+    "@details.level": getClassLevel(actor),
+    "@attributes.hp.value": tryNum(hp?.value) ?? 0,
+    "@attributes.hp.max": tryNum(hp?.max) ?? 0,
+    "@attributes.hp.temp": tryNum(hp?.temp) ?? 0,
+    "@attributes.hp.tempmax": tryNum(hp?.tempmax) ?? 0,
+  };
+
+  for (const k of ["str","dex","con","int","wis","cha"]) {
+    ctx[`@abilities.${k}.value`] = Number(abilities?.[k]?.score ?? 0);
+    ctx[`@abilities.${k}.mod`] = Number(abilities?.[k]?.mod ?? 0);
+  }
+
+  return { ...ctx, ...extra };
+}
+
+function effectNumericValue(actor, rawValue, extraCtx = {}) {
+  const direct = tryNum(rawValue);
+  if (Number.isFinite(direct)) return direct;
+  const formula = safeText(rawValue).trim();
+  if (!formula) return null;
+  const computed = evalFormula(formula, effectMathContext(actor, extraCtx));
+  return Number.isFinite(computed) ? computed : null;
+}
+
+function numericFormulaValue(actor, rawValue, extraCtx = {}) {
+  const val = effectNumericValue(actor, rawValue, { ...actorFormulaContext(actor), ...extraCtx });
+  return Number.isFinite(val) ? val : 0;
+}
+
 function getAllEffects(actor) {
   const effects = [];
   const actorEffects = actor?.effects || [];
@@ -750,6 +878,7 @@ function computeMovement(actor) {
   const keys = ["walk", "burrow", "climb", "fly", "swim"];
   const movement = actor?.system?.attributes?.movement || {};
   for (const k of keys) out[k] = tryNum(movement?.[k]) ?? 0;
+  const formulaCtx = actorFormulaContext(actor);
 
   const effects = getAllEffects(actor);
   for (const ef of effects) {
@@ -757,7 +886,14 @@ function computeMovement(actor) {
     for (const ch of changes) {
       const key = safeText(ch?.key).toLowerCase();
       if (!key.startsWith("system.attributes.movement.")) continue;
-      const val = tryNum(ch?.value);
+      const val = effectNumericValue(actor, ch?.value, {
+        ...formulaCtx,
+        "@attributes.movement.walk": out.walk,
+        "@attributes.movement.burrow": out.burrow,
+        "@attributes.movement.climb": out.climb,
+        "@attributes.movement.fly": out.fly,
+        "@attributes.movement.swim": out.swim,
+      });
       if (!Number.isFinite(val)) continue;
       const mode = Number(ch?.mode ?? MODE_CUSTOM);
 
@@ -793,6 +929,7 @@ function computeSenses(actor) {
   const senses = actor?.system?.attributes?.senses || {};
   const out = {};
   for (const k of keys) out[k] = tryNum(senses?.[k]) ?? 0;
+  const formulaCtx = actorFormulaContext(actor);
 
   const effects = getAllEffects(actor);
   for (const ef of effects) {
@@ -802,7 +939,13 @@ function computeSenses(actor) {
       const m = key.match(/^system\.attributes\.senses\.(darkvision|blindsight|tremorsense|truesight)$/);
       if (!m) continue;
 
-      const val = tryNum(ch?.value);
+      const val = effectNumericValue(actor, ch?.value, {
+        ...formulaCtx,
+        "@attributes.senses.darkvision": out.darkvision,
+        "@attributes.senses.blindsight": out.blindsight,
+        "@attributes.senses.tremorsense": out.tremorsense,
+        "@attributes.senses.truesight": out.truesight,
+      });
       if (!Number.isFinite(val)) continue;
       const mode = Number(ch?.mode ?? MODE_CUSTOM);
       const senseKey = m[1];
@@ -907,6 +1050,55 @@ function renderHitPointsValue(hp) {
   });
 }
 
+function computeAdjustedHP(actor) {
+  const baseHp = actor?.system?.attributes?.hp || {};
+  let max = Number(tryNum(baseHp?.max) ?? 0);
+  let value = tryNum(baseHp?.value);
+  if (!Number.isFinite(value)) value = max;
+  let temp = Number(tryNum(baseHp?.temp) ?? 0);
+  let tempmax = Number(tryNum(baseHp?.tempmax) ?? 0);
+  const formulaCtx = actorFormulaContext(actor);
+
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      if (
+        key !== "system.attributes.hp.value" &&
+        key !== "system.attributes.hp.max" &&
+        key !== "system.attributes.hp.temp" &&
+        key !== "system.attributes.hp.tempmax"
+      ) {
+        continue;
+      }
+
+      const val = effectNumericValue(actor, ch?.value, {
+        ...formulaCtx,
+        "@attributes.hp.value": value,
+        "@attributes.hp.max": max,
+        "@attributes.hp.temp": temp,
+        "@attributes.hp.tempmax": tempmax,
+      });
+      if (!Number.isFinite(val)) continue;
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+
+      if (key === "system.attributes.hp.value") value = applyNumericEffectMode(value, val, mode);
+      else if (key === "system.attributes.hp.max") max = applyNumericEffectMode(max, val, mode);
+      else if (key === "system.attributes.hp.temp") temp = applyNumericEffectMode(temp, val, mode);
+      else if (key === "system.attributes.hp.tempmax") tempmax = applyNumericEffectMode(tempmax, val, mode);
+    }
+  }
+
+  max = Math.max(0, Number(max) || 0);
+  tempmax = Number(tempmax) || 0;
+  const effectiveMax = Math.max(0, max + tempmax);
+  value = clamp(Number(value) || 0, 0, effectiveMax);
+  temp = Math.max(0, Number(temp) || 0);
+
+  return { value, max, temp, tempmax, effectiveMax };
+}
+
 function renderHitDiceValue(actor) {
   const hd = getHitDiceSummary(actor);
   if (hd.total <= 0) return "–";
@@ -930,9 +1122,11 @@ function extractACAdjustments(actor) {
     baseAdd: 0, baseOverride: null,
     dexAdd: 0, dexOverride: null,
     shieldAdd: 0, shieldOverride: null,
+    minAdd: 0, minOverride: null,
   };
 
   const effects = getAllEffects(actor);
+  const formulaCtx = actorFormulaContext(actor);
 
   for (const ef of effects) {
     const changes = ef?.changes || [];
@@ -941,7 +1135,7 @@ function extractACAdjustments(actor) {
       const mode = Number(ch?.mode ?? 0);
 
       // We only trust plain numbers here.
-      const val = tryNum(ch?.value);
+      const val = effectNumericValue(actor, ch?.value, formulaCtx);
       if (!Number.isFinite(val)) continue;
 
       const apply = (field) => {
@@ -952,6 +1146,7 @@ function extractACAdjustments(actor) {
       if (key === "system.attributes.ac.value") apply("value");
       else if (key === "system.attributes.ac.flat") adj.flatOverride = (mode === MODE_OVERRIDE ? val : (adj.flatOverride ?? 0) + val);
       else if (key === "system.attributes.ac.bonus") apply("bonus");
+      else if (key === "system.attributes.ac.min") apply("min");
       else if (key === "system.attributes.ac.armor") apply("armor");
       else if (key === "system.attributes.ac.base") apply("base");
       else if (key === "system.attributes.ac.dex") apply("dex");
@@ -1066,7 +1261,7 @@ function computeAC(actor) {
   const sys = actor?.system || {};
   const ac = sys?.attributes?.ac || {};
 
-  const abilities = getAbilities(actor);
+  const abilities = getEffectiveAbilities(actor);
   const dexMod = abilities.dex.mod;
 
   const parts = getACArmorParts(actor);
@@ -1094,14 +1289,17 @@ function computeAC(actor) {
   dexToken += (adj.dexAdd || 0);
 
   // Generic bonuses (rings, cloaks, effects, etc.).
-  let bonusToken = parseBonusString(ac?.bonus);
+  let bonusToken = numericFormulaValue(actor, ac?.bonus);
   if (Number.isFinite(adj.bonusOverride)) bonusToken = adj.bonusOverride;
   bonusToken += (adj.bonusAdd || 0);
 
   // Direct "add to AC value" effects (treated as bonus).
   bonusToken += (adj.valueAdd || 0);
 
-  const pb = getProfBonus(actor);
+  const pb = getEffectiveProfBonus(actor);
+  let minToken = numericFormulaValue(actor, ac?.min);
+  if (Number.isFinite(adj.minOverride)) minToken = adj.minOverride;
+  minToken += (adj.minAdd || 0);
 
   // 1) Custom formula gets first bite of the apple.
   // Some exports keep formula populated even when calc isn't strictly "custom" – if a formula exists, we honour it.
@@ -1115,7 +1313,7 @@ function computeAC(actor) {
       let val = armorToken + dexMod;
       val += shieldToken;  // shield is still part of AC unless explicitly omitted
       val += bonusToken;
-      return Math.round(val);
+      return Math.round(Math.max(val, minToken || 0));
     }
 
     const ctx = {
@@ -1140,7 +1338,7 @@ function computeAC(actor) {
       // This keeps "@attributes.ac.armor+@abilities.dex.mod" (and similar) correct without forcing everyone to write verbose formulas.
       if (!lowerRaw.includes("@attributes.ac.shield")) val += shieldToken;
       if (!lowerRaw.includes("@attributes.ac.bonus")) val += bonusToken;
-      return Math.round(val);
+      return Math.round(Math.max(val, minToken || 0));
     }
 
     // Fallback for custom formulas that explicitly request uncapped DEX but fail parser checks.
@@ -1154,17 +1352,17 @@ function computeAC(actor) {
   }
 
   // 2) Flat overrides (rare but explicit).
-  if (Number.isFinite(adj.flatOverride)) return Math.round(adj.flatOverride + bonusToken);
+  if (Number.isFinite(adj.flatOverride)) return Math.round(Math.max(adj.flatOverride + bonusToken, minToken || 0));
 
   // 3) Direct AC value override from effects (e.g., "your AC becomes 13").
-  if (Number.isFinite(adj.valueOverride)) return Math.round(adj.valueOverride + bonusToken);
+  if (Number.isFinite(adj.valueOverride)) return Math.round(Math.max(adj.valueOverride + bonusToken, minToken || 0));
 
   // 4) If snapshot already has a numeric ac.value, trust it (and still add numeric bonuses we found).
   const rawValue = tryNum(ac?.value);
-  if (Number.isFinite(rawValue)) return Math.round(rawValue + bonusToken);
+  if (Number.isFinite(rawValue)) return Math.round(Math.max(rawValue + bonusToken, minToken || 0));
 
   // 5) Default: armour + shield + capped dex + bonuses.
-  return Math.round(armorToken + shieldToken + dexToken + bonusToken);
+  return Math.round(Math.max(armorToken + shieldToken + dexToken + bonusToken, minToken || 0));
 }
 
 function acIsAugmented(actor) {
@@ -1172,14 +1370,15 @@ function acIsAugmented(actor) {
   const ac = sys?.attributes?.ac || {};
   const adj = extractACAdjustments(actor);
 
-  if (hasNumericDelta(parseBonusString(ac?.bonus))) return true;
+  if (hasNumericDelta(numericFormulaValue(actor, ac?.bonus))) return true;
+  if (hasNumericDelta(numericFormulaValue(actor, ac?.min))) return true;
 
-  const addKeys = ["valueAdd", "bonusAdd", "armorAdd", "baseAdd", "dexAdd", "shieldAdd"];
+  const addKeys = ["valueAdd", "bonusAdd", "armorAdd", "baseAdd", "dexAdd", "shieldAdd", "minAdd"];
   for (const k of addKeys) {
     if (hasNumericDelta(adj?.[k])) return true;
   }
 
-  const overrideKeys = ["valueOverride", "flatOverride", "bonusOverride", "armorOverride", "baseOverride", "dexOverride", "shieldOverride"];
+  const overrideKeys = ["valueOverride", "flatOverride", "bonusOverride", "armorOverride", "baseOverride", "dexOverride", "shieldOverride", "minOverride"];
   for (const k of overrideKeys) {
     if (Number.isFinite(adj?.[k])) return true;
   }
@@ -1209,6 +1408,145 @@ const SKILL_ABILITY_FALLBACK = {
   acr: "dex", ani: "wis", arc: "int", ath: "str", dec: "cha", his: "int", ins: "wis", itm: "cha",
   inv: "int", med: "wis", nat: "int", prc: "wis", prf: "cha", per: "cha", rel: "int", sle: "dex", ste: "dex", sur: "wis"
 };
+const LANGUAGE_LABELS = {
+  common: "Common",
+  "common-sign-language": "Common Sign Language",
+  csl: "Common Sign Language",
+  draconic: "Draconic",
+  dwarvish: "Dwarvish",
+  elvish: "Elvish",
+  giant: "Giant",
+  gnomish: "Gnomish",
+  goblin: "Goblin",
+  halfling: "Halfling",
+  orc: "Orc",
+  abyssal: "Abyssal",
+  celestial: "Celestial",
+  deep: "Deep Speech",
+  "deep-speech": "Deep Speech",
+  infernal: "Infernal",
+  primordial: "Primordial",
+  sylvan: "Sylvan",
+  undercommon: "Undercommon",
+  druidic: "Druidic",
+  thievescant: "Thieves' Cant",
+  "thieves-cant": "Thieves' Cant"
+};
+
+function normaliseTagToken(raw) {
+  return norm(raw).replace(/[_\s]+/g, "-");
+}
+
+function effectConditionTags(effect) {
+  const tags = new Set();
+  const add = (raw) => {
+    const t = normaliseTagToken(raw);
+    if (t) tags.add(t);
+  };
+
+  const rawStatuses = effect?.statuses;
+  if (Array.isArray(rawStatuses)) {
+    const bits = rawStatuses.map((x) => safeText(x).trim()).filter(Boolean);
+    const merged = bits.length && bits.every((x) => x.length === 1) ? [bits.join("")] : bits;
+    for (const b of merged) add(b);
+  } else {
+    add(rawStatuses);
+  }
+
+  add(effect?.name);
+  return tags;
+}
+
+function actorConditionTags(actor) {
+  const tags = new Set();
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    for (const t of effectConditionTags(ef)) tags.add(t);
+  }
+
+  const exhaustion = tryNum(actor?.system?.attributes?.exhaustion?.value ?? actor?.system?.attributes?.exhaustion);
+  if (Number.isFinite(exhaustion) && exhaustion > 0) tags.add("exhaustion");
+
+  return tags;
+}
+
+function languageLabel(raw) {
+  const key = normaliseTagToken(raw);
+  if (!key) return "";
+  if (LANGUAGE_LABELS[key]) return LANGUAGE_LABELS[key];
+  return titleCaseWords(key.replace(/-/g, " "));
+}
+
+function collectLanguages(actor) {
+  const langs = actor?.system?.traits?.languages || {};
+  const out = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const label = languageLabel(raw);
+    if (!label) return;
+    const k = norm(label);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(label);
+  };
+
+  const valueRaw = langs?.value;
+  if (Array.isArray(valueRaw)) {
+    for (const v of valueRaw) add(v);
+  } else if (valueRaw && typeof valueRaw === "object") {
+    for (const k of Object.keys(valueRaw)) {
+      if (valueRaw[k]) add(k);
+    }
+  }
+
+  const custom = safeText(langs?.custom).trim();
+  if (custom) {
+    custom.split(/[,\n;]+/).map((x) => x.trim()).filter(Boolean).forEach(add);
+  }
+
+  let allLanguages = Boolean(langs?.all);
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      if (key !== "system.traits.languages.all") continue;
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+      const on = isTruthyEffectValue(ch?.value);
+      if (mode === MODE_CUSTOM || mode === MODE_OVERRIDE) allLanguages = on;
+      else if (mode === MODE_ADD && on) allLanguages = true;
+    }
+  }
+  if (allLanguages) add("All Languages");
+
+  return out;
+}
+
+function renderLanguagesBlock(actor) {
+  const wrap = document.createElement("div");
+  wrap.className = "rounded-2xl bg-slate-950/40 border border-white/10 px-3 py-2";
+
+  const title = document.createElement("div");
+  title.className = "text-xs text-slate-400";
+  title.textContent = "Languages";
+  wrap.appendChild(title);
+
+  const body = document.createElement("div");
+  body.className = "mt-1 text-sm";
+  const langs = collectLanguages(actor);
+  body.textContent = langs.length ? langs.join(", ") : "—";
+  wrap.appendChild(body);
+
+  return wrap;
+}
+
+function renderSkillsSection(actor) {
+  const wrap = document.createElement("div");
+  wrap.className = "space-y-2";
+  wrap.appendChild(renderSkillsGrid(actor));
+  wrap.appendChild(renderLanguagesBlock(actor));
+  return wrap;
+}
 
 function skillAbilityKey(actor, key) {
   return actor?.system?.skills?.[key]?.ability || SKILL_ABILITY_FALLBACK[key] || "wis";
@@ -1218,6 +1556,7 @@ function collectSkillRollModes(actor) {
   const keys = Object.keys(SKILL_LABELS);
   const out = {};
   for (const k of keys) out[k] = 0;
+  const formulaCtx = actorFormulaContext(actor);
 
   const apply = (skillKey, value, mode) => {
     if (!Object.prototype.hasOwnProperty.call(out, skillKey)) return;
@@ -1233,7 +1572,7 @@ function collectSkillRollModes(actor) {
 
       const rollModeMatch = key.match(/^system\.skills\.([a-z]{3})\.roll\.mode$/);
       if (rollModeMatch) {
-        const val = tryNum(ch?.value);
+        const val = effectNumericValue(actor, ch?.value, formulaCtx);
         if (Number.isFinite(val)) apply(rollModeMatch[1], val, mode);
         continue;
       }
@@ -1251,6 +1590,11 @@ function collectSkillRollModes(actor) {
         else apply(disMatch[1], -1, mode);
       }
     }
+  }
+
+  const conditions = actorConditionTags(actor);
+  if (conditions.has("poisoned") || conditions.has("exhaustion")) {
+    for (const sk of keys) apply(sk, -1, MODE_ADD);
   }
 
   for (const k of keys) {
@@ -1274,16 +1618,10 @@ function skillModeBadge(mode) {
 
 function renderSkillsGrid(actor) {
   const modeBySkill = collectSkillRollModes(actor);
-  const bonuses = collectCheckSaveBonuses(actor);
   const rows = Object.keys(SKILL_LABELS).map((k) => {
     const badge = skillModeBadge(modeBySkill[k] || 0);
-    const abilityKey = skillAbilityKey(actor, k);
-    const misc =
-      (bonuses?.skillCheck?.[k] ?? 0) +
-      (bonuses?.abilityCheck?.[abilityKey] ?? 0) +
-      (bonuses?.globalCheck ?? 0);
     const rawVal = `${fmtSigned(skillBonus(actor, k))}${badge ? ` ${badge}` : ""}`;
-    const val = highlightAugmentedHtml(rawVal, hasNumericDelta(misc));
+    const val = highlightAugmentedHtml(rawVal, skillIsAugmented(actor, k));
     return [SKILL_LABELS[k], val];
   });
   return kvGrid(rows);
@@ -1294,6 +1632,7 @@ function collectSaveRollModes(actor) {
   for (const k of SAVE_KEYS) {
     out[k] = tryNum(actor?.system?.abilities?.[k]?.save?.roll?.mode) ?? 0;
   }
+  const formulaCtx = actorFormulaContext(actor);
 
   const apply = (abilityKey, value, mode) => {
     if (!Object.prototype.hasOwnProperty.call(out, abilityKey)) return;
@@ -1309,7 +1648,7 @@ function collectSaveRollModes(actor) {
 
       const rollModeMatch = key.match(/^system\.abilities\.(str|dex|con|int|wis|cha)\.save\.roll\.mode$/);
       if (rollModeMatch) {
-        const val = tryNum(ch?.value);
+        const val = effectNumericValue(actor, ch?.value, formulaCtx);
         if (Number.isFinite(val)) apply(rollModeMatch[1], val, mode);
         continue;
       }
@@ -1329,6 +1668,9 @@ function collectSaveRollModes(actor) {
     }
   }
 
+  const conditions = actorConditionTags(actor);
+  if (conditions.has("restrained")) apply("dex", -1, MODE_ADD);
+
   for (const k of SAVE_KEYS) {
     if (out[k] > 0) out[k] = 1;
     else if (out[k] < 0) out[k] = -1;
@@ -1339,6 +1681,7 @@ function collectSaveRollModes(actor) {
 
 function collectInitiativeRollMode(actor) {
   let out = tryNum(actor?.system?.attributes?.init?.roll?.mode) ?? 0;
+  const formulaCtx = actorFormulaContext(actor);
 
   const effects = getAllEffects(actor);
   for (const ef of effects) {
@@ -1348,7 +1691,7 @@ function collectInitiativeRollMode(actor) {
       const mode = Number(ch?.mode ?? MODE_CUSTOM);
 
       if (key === "system.attributes.init.roll.mode") {
-        const v = tryNum(ch?.value);
+        const v = effectNumericValue(actor, ch?.value, formulaCtx);
         if (Number.isFinite(v)) out = applyNumericEffectMode(out, v, mode);
         continue;
       }
@@ -1372,9 +1715,38 @@ function collectInitiativeRollMode(actor) {
     }
   }
 
+  const conditions = actorConditionTags(actor);
+  if (conditions.has("poisoned") || conditions.has("exhaustion")) {
+    out = applyNumericEffectMode(out, -1, MODE_ADD);
+  }
+
   if (out > 0) return 1;
   if (out < 0) return -1;
   return 0;
+}
+
+function initiativeBonus(actor) {
+  const abilities = getEffectiveAbilities(actor);
+  const formulaCtx = actorFormulaContext(actor);
+  let bonus = numericFormulaValue(actor, actor?.system?.attributes?.init?.bonus, formulaCtx);
+
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      if (key !== "system.attributes.init.bonus") continue;
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+      const val = effectNumericValue(actor, ch?.value, {
+        ...formulaCtx,
+        "@attributes.init.bonus": bonus
+      });
+      if (!Number.isFinite(val)) continue;
+      bonus = applyNumericEffectMode(bonus, val, mode);
+    }
+  }
+
+  return Number(abilities?.dex?.mod ?? 0) + (Number(bonus) || 0);
 }
 
 function proficiencyMultiplier(value) {
@@ -1383,38 +1755,95 @@ function proficiencyMultiplier(value) {
   return val;
 }
 
+function saveProficiencyValue(actor, abilityKey) {
+  let prof = proficiencyMultiplier(actor?.system?.abilities?.[abilityKey]?.proficient);
+  const formulaCtx = actorFormulaContext(actor);
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const key = safeText(ch?.key).toLowerCase();
+      const m = key.match(/^system\.abilities\.(str|dex|con|int|wis|cha)\.proficient$/);
+      if (!m || m[1] !== abilityKey) continue;
+      const val = effectNumericValue(actor, ch?.value, formulaCtx);
+      if (!Number.isFinite(val)) continue;
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+      prof = applyNumericEffectMode(prof, val, mode);
+    }
+  }
+  return Math.max(0, Number(prof) || 0);
+}
+
+function skillConfig(actor, key) {
+  const sysSkill = actor?.system?.skills?.[key] || {};
+  let abilityKey = sysSkill?.ability || skillAbilityKey(actor, key);
+  let profMult = proficiencyMultiplier(sysSkill?.value);
+  let flatMod = 0;
+
+  const formulaCtx = actorFormulaContext(actor);
+  const effects = getAllEffects(actor);
+  for (const ef of effects) {
+    const changes = ef?.changes || [];
+    for (const ch of changes) {
+      const effectKey = safeText(ch?.key).toLowerCase();
+
+      const m = effectKey.match(/^system\.skills\.([a-z]{3})\.(value|ability|mod)$/);
+      if (!m || m[1] !== key) continue;
+
+      const field = m[2];
+      const mode = Number(ch?.mode ?? MODE_CUSTOM);
+
+      if (field === "ability") {
+        const next = norm(ch?.value);
+        if (SAVE_KEYS.includes(next)) abilityKey = next;
+        continue;
+      }
+
+      const val = effectNumericValue(actor, ch?.value, formulaCtx);
+      if (!Number.isFinite(val)) continue;
+
+      if (field === "value") profMult = applyNumericEffectMode(profMult, val, mode);
+      else flatMod = applyNumericEffectMode(flatMod, val, mode);
+    }
+  }
+
+  return { abilityKey, profMult: Math.max(0, Number(profMult) || 0), flatMod };
+}
+
 const checkSaveBonusCache = new WeakMap();
 
 function collectCheckSaveBonuses(actor) {
   if (actor && checkSaveBonusCache.has(actor)) return checkSaveBonusCache.get(actor);
 
   const sys = actor?.system || {};
+  const formulaCtx = actorFormulaContext(actor);
+  const parse = (raw) => numericFormulaValue(actor, raw, formulaCtx);
   const out = {
-    globalCheck: parseBonusString(sys?.bonuses?.abilities?.check),
-    globalSave: parseBonusString(sys?.bonuses?.abilities?.save),
+    globalCheck: parse(sys?.bonuses?.abilities?.check),
+    globalSave: parse(sys?.bonuses?.abilities?.save),
     abilityCheck: {},
     abilitySave: {},
     skillCheck: {}
   };
 
   for (const ab of SAVE_KEYS) {
-    out.abilityCheck[ab] = parseBonusString(sys?.abilities?.[ab]?.bonuses?.check);
-    out.abilitySave[ab] = parseBonusString(sys?.abilities?.[ab]?.bonuses?.save);
+    out.abilityCheck[ab] = parse(sys?.abilities?.[ab]?.bonuses?.check);
+    out.abilitySave[ab] = parse(sys?.abilities?.[ab]?.bonuses?.save);
   }
 
   const skillKeys = new Set([...Object.keys(SKILL_LABELS), ...Object.keys(sys?.skills || {})]);
   for (const sk of skillKeys) {
-    out.skillCheck[sk] = parseBonusString(sys?.skills?.[sk]?.bonuses?.check);
+    out.skillCheck[sk] = parse(sys?.skills?.[sk]?.bonuses?.check);
   }
 
   const effects = getAllEffects(actor);
   for (const ef of effects) {
-    const changes = ef?.changes || [];
-    for (const ch of changes) {
-      const key = safeText(ch?.key).toLowerCase();
-      const mode = Number(ch?.mode ?? MODE_CUSTOM);
-      const val = tryNum(ch?.value);
-      if (!Number.isFinite(val)) continue;
+      const changes = ef?.changes || [];
+      for (const ch of changes) {
+        const key = safeText(ch?.key).toLowerCase();
+        const mode = Number(ch?.mode ?? MODE_CUSTOM);
+        const val = effectNumericValue(actor, ch?.value, formulaCtx);
+        if (!Number.isFinite(val)) continue;
 
       if (key === "system.bonuses.abilities.check") {
         out.globalCheck = applyNumericEffectMode(out.globalCheck, val, mode);
@@ -1452,17 +1881,26 @@ function collectCheckSaveBonuses(actor) {
 function saveIsAugmented(actor, abilityKey) {
   const bonuses = collectCheckSaveBonuses(actor);
   const misc = (bonuses?.abilitySave?.[abilityKey] ?? 0) + (bonuses?.globalSave ?? 0);
-  return hasNumericDelta(misc);
+  if (hasNumericDelta(misc)) return true;
+  const baseProf = proficiencyMultiplier(actor?.system?.abilities?.[abilityKey]?.proficient);
+  const effProf = saveProficiencyValue(actor, abilityKey);
+  return hasNumericDelta(effProf - baseProf);
 }
 
 function skillIsAugmented(actor, skillKey) {
   const bonuses = collectCheckSaveBonuses(actor);
-  const abilityKey = skillAbilityKey(actor, skillKey);
+  const baseAbilityKey = skillAbilityKey(actor, skillKey);
+  const cfg = skillConfig(actor, skillKey);
   const misc =
     (bonuses?.skillCheck?.[skillKey] ?? 0) +
-    (bonuses?.abilityCheck?.[abilityKey] ?? 0) +
+    (bonuses?.abilityCheck?.[cfg.abilityKey] ?? 0) +
     (bonuses?.globalCheck ?? 0);
-  return hasNumericDelta(misc);
+  if (hasNumericDelta(misc)) return true;
+  if (cfg.abilityKey !== baseAbilityKey) return true;
+  const baseProf = proficiencyMultiplier(actor?.system?.skills?.[skillKey]?.value);
+  if (hasNumericDelta(cfg.profMult - baseProf)) return true;
+  if (hasNumericDelta(cfg.flatMod)) return true;
+  return false;
 }
 
 function saveProficiencyPip(value) {
@@ -1471,13 +1909,11 @@ function saveProficiencyPip(value) {
 }
 
 function savingThrowBonus(actor, abilityKey) {
-  const sys = actor?.system || {};
-  const abilities = getAbilities(actor);
-  const pb = getProfBonus(actor);
+  const abilities = getEffectiveAbilities(actor);
+  const pb = getEffectiveProfBonus(actor);
   const checkSaveBonuses = collectCheckSaveBonuses(actor);
 
-  const ab = sys?.abilities?.[abilityKey] || {};
-  const prof = proficiencyMultiplier(ab?.proficient);
+  const prof = saveProficiencyValue(actor, abilityKey);
   const misc = (checkSaveBonuses?.abilitySave?.[abilityKey] ?? 0) + (checkSaveBonuses?.globalSave ?? 0);
   const abilityModValue = abilities?.[abilityKey]?.mod ?? 0;
 
@@ -1485,13 +1921,12 @@ function savingThrowBonus(actor, abilityKey) {
 }
 
 function renderSavesGrid(actor) {
-  const abilities = getAbilities(actor);
+  const abilities = getEffectiveAbilities(actor);
   const modeBySave = collectSaveRollModes(actor);
-  const sysAbilities = actor?.system?.abilities || {};
 
   const rows = SAVE_KEYS.map((k) => {
     const label = `${safeText(abilities?.[k]?.label || k.toUpperCase())} Save`;
-    const profPip = saveProficiencyPip(sysAbilities?.[k]?.proficient);
+    const profPip = saveProficiencyPip(saveProficiencyValue(actor, k));
     const badge = skillModeBadge(modeBySave[k] || 0);
     const rawValue = `${fmtSigned(savingThrowBonus(actor, k))}${profPip ? ` ${profPip}` : ""}${badge ? ` ${badge}` : ""}`;
     const value = highlightAugmentedHtml(rawValue, saveIsAugmented(actor, k));
@@ -1502,45 +1937,41 @@ function renderSavesGrid(actor) {
 }
 
 function skillBonus(actor, key) {
-  const sys = actor?.system || {};
-  const abilities = getAbilities(actor);
-  const pb = getProfBonus(actor);
+  const abilities = getEffectiveAbilities(actor);
+  const pb = getEffectiveProfBonus(actor);
   const checkSaveBonuses = collectCheckSaveBonuses(actor);
 
-  const sk = sys?.skills?.[key] || {};
-  const abilityKey = sk?.ability || skillAbilityKey(actor, key);
-
-  const aMod = abilities?.[abilityKey]?.mod ?? 0;
-  const profMult = proficiencyMultiplier(sk?.value); // 0 untrained, 0.5 half, 1 prof, 2 expertise
+  const cfg = skillConfig(actor, key);
+  const aMod = abilities?.[cfg.abilityKey]?.mod ?? 0;
   const misc =
     (checkSaveBonuses?.skillCheck?.[key] ?? 0) +
-    (checkSaveBonuses?.abilityCheck?.[abilityKey] ?? 0) +
+    (checkSaveBonuses?.abilityCheck?.[cfg.abilityKey] ?? 0) +
     (checkSaveBonuses?.globalCheck ?? 0);
 
-  return aMod + (pb * profMult) + misc;
+  return aMod + (pb * cfg.profMult) + misc + (Number(cfg.flatMod) || 0);
 }
 
 function passiveSkill(actor, key) {
   const sys = actor?.system || {};
   const sk = sys?.skills?.[key] || {};
-  const misc = parseBonusString(sk?.bonuses?.passive);
+  const misc = numericFormulaValue(actor, sk?.bonuses?.passive);
   return 10 + skillBonus(actor, key) + misc;
 }
 
 function dnd5eMeta(actor) {
   const sys = actor?.system || {};
-  const hp = sys?.attributes?.hp || {};
+  const hp = computeAdjustedHP(actor);
   const items = actor?.items || [];
   const classes = items.filter(i => i?.type === "class");
   const level = getClassLevel(actor) || "";
   const classNames = classes.map(c => c?.name).filter(Boolean).join(", ");
 
   const acVal = computeAC(actor);
-  const pb = getProfBonus(actor);
+  const pb = getEffectiveProfBonus(actor);
 
   return {
     line1: [classNames || sys?.details?.class || "Character", level ? `Lv ${level}` : ""].filter(Boolean).join(" • "),
-    line2: [`AC ${acVal ?? "–"}`, `HP ${hp?.value ?? "–"}/${hp?.max ?? "–"}`, `PB ${fmtSigned(pb ?? 0)}`].join("  ·  ")
+    line2: [`AC ${acVal ?? "–"}`, `HP ${hp.value}/${hp.effectiveMax}`, `PB ${fmtSigned(pb ?? 0)}`].join("  ·  ")
   };
 }
 
@@ -1799,7 +2230,7 @@ function spellSaveDCInfo(actor) {
   let baseDirect = tryNum(sys?.attributes?.spelldc);
   if (!Number.isFinite(baseDirect)) baseDirect = tryNum(sys?.attributes?.spell?.dc);
 
-  const baseBonus = parseBonusString(sys?.bonuses?.spell?.dc);
+  const baseBonus = numericFormulaValue(actor, sys?.bonuses?.spell?.dc);
   let bonus = baseBonus;
   let augmented = hasNumericDelta(baseBonus);
 
@@ -2246,7 +2677,7 @@ function renderDnd5e(payload) {
   contentCol.appendChild(hero);
   quickLinks.push({ label: "Overview", id: overviewId });
 
-  const abilities = getAbilities(actor);
+  const abilities = getEffectiveAbilities(actor);
   const abilityRows = [
     ["STR", `${abilities.str.score} (${fmtSigned(abilities.str.mod)})`],
     ["DEX", `${abilities.dex.score} (${fmtSigned(abilities.dex.mod)})`],
@@ -2262,23 +2693,24 @@ function renderDnd5e(payload) {
   const attr = sys?.attributes || {};
   const movement = computeMovement(actor);
   const senses = computeSenses(actor);
-  const hp = attr?.hp || {};
+  const hp = computeAdjustedHP(actor);
   const tempHp = Math.max(0, Number(tryNum(hp?.temp) ?? 0));
-  const pb = getProfBonus(actor);
+  const pb = getEffectiveProfBonus(actor);
   const acVal = computeAC(actor);
   const acAugmented = acIsAugmented(actor);
+  const initValue = initiativeBonus(actor);
   const initMode = collectInitiativeRollMode(actor);
   const initBadge = skillModeBadge(initMode);
   const passivePerceptionValue = passiveSkill(actor, "prc");
   const passivePerceptionAugmented =
-    skillIsAugmented(actor, "prc") || hasNumericDelta(parseBonusString(sys?.skills?.prc?.bonuses?.passive));
+    skillIsAugmented(actor, "prc") || hasNumericDelta(numericFormulaValue(actor, sys?.skills?.prc?.bonuses?.passive));
 
   const combatRows = [
     ["Armour Class", highlightAugmentedHtml(acVal ?? "–", acAugmented)],
-    ["Hit Points", renderHitPointsValue(hp)],
+    ["Hit Points", renderHitPointsValue({ value: hp.value, max: hp.effectiveMax, temp: hp.temp })],
     ["Hit Dice", renderHitDiceValue(actor)],
     ...(tempHp > 0 ? [["Temporary Hit Points", `+${tempHp}`]] : []),
-    ["Initiative", `${fmtSigned(abilities.dex.mod)}${initBadge ? ` ${initBadge}` : ""}`],
+    ["Initiative", `${fmtSigned(initValue)}${initBadge ? ` ${initBadge}` : ""}`],
     ["Proficiency Bonus", fmtSigned(pb)],
     ["Speed", formatMovement(movement)],
     ["Senses", formatSenses(senses, attr?.senses?.special)],
@@ -2294,7 +2726,7 @@ function renderDnd5e(payload) {
 
   // skills
   const skillsId = makeAnchorId(anchorPrefix, "Skills");
-  contentCol.appendChild(section("Skills", renderSkillsGrid(actor), skillsId));
+  contentCol.appendChild(section("Skills", renderSkillsSection(actor), skillsId));
   quickLinks.push({ label: "Skills", id: skillsId });
 
   const effectsId = makeAnchorId(anchorPrefix, "Active Effects");
