@@ -2055,7 +2055,8 @@ function collectAttunementState(actor) {
   const max = Math.max(0, Math.floor(Number.isFinite(maxRaw) ? maxRaw : 3));
 
   const items = actor?.items || [];
-  const attunedItems = items.filter((it) => itemIsAttuned(it));
+  // Only consume attunement slots for items that both require attunement and are attuned.
+  const attunedItems = items.filter((it) => itemRequiresAttunement(it) && itemIsAttuned(it));
 
   return {
     max,
