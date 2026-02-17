@@ -82,6 +82,112 @@ function actorFromPayload(payload) {
   return payload?.actor || payload?.data?.actor || payload?.document || payload;
 }
 
+const CRIT_COIN_STORAGE_PREFIX = "fcv.crit-coin.";
+
+function actorHasInspiration(actor) {
+  const direct = actor?.system?.attributes?.inspiration;
+  if (typeof direct === "boolean") return direct;
+  const n = tryNum(direct);
+  if (Number.isFinite(n)) return n > 0;
+  const s = norm(direct);
+  return s === "true" || s === "yes" || s === "on";
+}
+
+function critCoinStorageKey(actor) {
+  const id = safeText(actor?._id || actor?.id || actor?.name || "unknown").trim() || "unknown";
+  return `${CRIT_COIN_STORAGE_PREFIX}${id}`;
+}
+
+function readCritCoin(actor) {
+  const key = critCoinStorageKey(actor);
+  try {
+    const raw = localStorage.getItem(key);
+    const n = Math.floor(Number(raw));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeCritCoin(actor, value) {
+  const key = critCoinStorageKey(actor);
+  const safe = Math.max(0, Math.floor(Number(value) || 0));
+  try {
+    localStorage.setItem(key, String(safe));
+  } catch {
+    // Ignore storage failures; counter still works for the current render.
+  }
+}
+
+function inspirationBadgeNode(actor) {
+  const active = actorHasInspiration(actor);
+  const el = document.createElement("div");
+  el.className = `inline-flex items-center gap-2 rounded-xl border px-2 py-1 ${
+    active
+      ? "border-amber-200/70 bg-amber-500/15 text-amber-100"
+      : "border-white/15 bg-white/5 text-slate-200"
+  }`;
+  el.title = active ? "Heroic Inspiration available" : "No Heroic Inspiration";
+  el.innerHTML = `
+    <span class="inline-flex h-4 w-4 items-center justify-center rounded border ${
+      active ? "border-amber-200/80 bg-amber-300" : "border-slate-300/70 bg-transparent"
+    }"></span>
+    <span class="text-[10px] uppercase tracking-wide font-semibold">Inspiration</span>
+  `;
+  return el;
+}
+
+function critCoinControlNode(actor) {
+  const el = document.createElement("div");
+  el.className = "inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/5 px-2 py-1";
+  el.title = "Crit Coin tracker";
+
+  const label = document.createElement("span");
+  label.className = "text-[10px] uppercase tracking-wide font-semibold text-slate-200";
+  label.textContent = "Crit Coin";
+
+  const minus = document.createElement("button");
+  minus.type = "button";
+  minus.className = "h-5 w-5 rounded border border-white/20 bg-slate-900/70 text-slate-100 hover:bg-slate-800 transition";
+  minus.textContent = "-";
+  minus.setAttribute("aria-label", "Decrease Crit Coin");
+
+  const valueEl = document.createElement("span");
+  valueEl.className = "min-w-[1.5rem] text-center text-sm font-semibold text-amber-300";
+
+  const plus = document.createElement("button");
+  plus.type = "button";
+  plus.className = "h-5 w-5 rounded border border-white/20 bg-slate-900/70 text-slate-100 hover:bg-slate-800 transition";
+  plus.textContent = "+";
+  plus.setAttribute("aria-label", "Increase Crit Coin");
+
+  let value = readCritCoin(actor);
+  const paint = () => {
+    value = Math.max(0, Math.floor(Number(value) || 0));
+    valueEl.textContent = String(value);
+    writeCritCoin(actor, value);
+  };
+
+  minus.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    value = Math.max(0, value - 1);
+    paint();
+  });
+  plus.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    value += 1;
+    paint();
+  });
+
+  el.appendChild(label);
+  el.appendChild(minus);
+  el.appendChild(valueEl);
+  el.appendChild(plus);
+  paint();
+
+  return el;
+}
+
 function resolveItemNameById(actor, id, preferredTypes = []) {
   const wantedId = safeText(id).trim();
   if (!wantedId) return "";
@@ -2118,12 +2224,18 @@ function renderDnd5e(payload) {
       <div class="min-w-0 flex-1">
         <div class="flex flex-wrap items-center gap-2">
           <h2 class="text-2xl font-semibold tracking-tight truncate">${safeText(actor?.name)}</h2>
+          <div id="heroTrackers" class="flex flex-wrap items-center gap-2"></div>
         </div>
         <div class="mt-1 text-slate-300">${safeText(meta.line1)}</div>
         <div class="mt-2 flex flex-wrap gap-2" id="pills"></div>
       </div>
     </div>
   `;
+  const trackersHost = hero.querySelector("#heroTrackers");
+  if (trackersHost) {
+    trackersHost.appendChild(inspirationBadgeNode(actor));
+    trackersHost.appendChild(critCoinControlNode(actor));
+  }
   const pills = hero.querySelector("#pills");
   pills.appendChild(pill(meta.line2));
   const race = detailLabel(actor, sys?.details?.race, ["race"]);
