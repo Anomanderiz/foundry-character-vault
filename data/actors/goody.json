@@ -1,5 +1,5 @@
 {
-  "exportedAt": "2026-02-28T06:53:04.242Z",
+  "exportedAt": "2026-03-14T07:26:21.178Z",
   "systemId": "dnd5e",
   "foundryVersion": "13.348",
   "actor": {
@@ -8845,7 +8845,7 @@
             }
           },
           "uses": {
-            "spent": 0,
+            "spent": 1,
             "max": "@scale.soulknife.energy-die.number",
             "recovery": [
               {
